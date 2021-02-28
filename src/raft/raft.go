@@ -18,14 +18,28 @@ package raft
 //
 
 import (
+	"bytes"
+	"encoding/binary"
 	"labrpc"
+	"log"
+	"math/rand"
 	"sync"
 	"sync/atomic"
+	"syscall"
+	"time"
+	"unsafe"
 )
 
 // import "bytes"
 // import "6.824/labgob"
 
+// Some global values
+// Heartbeat period of leader to send, ms.
+var heartbeatCircle = 100
+// Election timeout, ms.
+var electionTimeoutUpper = 450
+var electionTimeoutLower = 300
+var defaultLogCapacity = 1000
 
 
 //
@@ -54,33 +68,58 @@ type ApplyMsg struct {
 type ServerRole int
 
 const (
-	FOLLOWER = iota
-
+	FOLLOWER  ServerRole = iota
+	CANDIDATE
+	LEADER
 )
+
+type LogEntry struct{
+	term		int			// Term of this log entry
+	// todo: other data type will be added to stored main info of the log entry
+}
+
+func (le *LogEntry) toBytes() []byte{
+	var ret	[]byte
+	err := binary.Write(bytes.NewBuffer(ret[:]), binary.LittleEndian, le)
+	if err != nil{
+		log.Println(err.Error())
+		// If failed to write LogEntry to []byte, then filled a []byte with 0 which has a same size as LogEntry
+		err = binary.Write(bytes.NewBuffer(ret[:]), binary.LittleEndian, make([]byte, int(unsafe.Sizeof(LogEntry{}))))
+		if err != nil{
+			log.Println(err.Error())
+			syscall.Exit(-1)
+		}
+	}
+	return ret
+}
 
 
 //
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
-	peers     []*labrpc.ClientEnd // RPC end points of all peers
-	persister *Persister          // Object to hold this peer's persisted state
-	me        int                 // this peer's index into peers[]
-	dead      int32               // set by Kill()
+	mu			sync.Mutex          // Lock to protect shared access to this peer's state
+	peers     	[]*labrpc.ClientEnd // RPC end points of all peers
+	persister 	*Persister          // Object to hold this peer's persisted state
+	me        	int                 // this peer's index into peers[]
+	dead      	int32               // set by Kill()
+	role		ServerRole			// Role of this server in the cluster.
 
-	// Update on stable storage before responding to RPCs
+	// Update on stable storage before responding to RPC
 	currentTerm		int
 	votedFor		int				// ID of the raft this raft peer voted for.
 	logs			[]byte			// log entries, do not define for now.
 
 
 	committedIndex	int				// Index of highest entry known to be committed
-	lastApplied		int				// Index of
+	lastApplied		int				// Index of highest log entry applied to state machine
 
 	//Reinitialized after election, only held by leaders.
 	nextIndex[]		int 			// For each server, index of next log entry sent that
 	matchIndex[]	int				// For each server, index of highest log entry known to be replicated on server.
+
+
+	heartbeatCounter	int			// A counter count for time span of heartbeat call
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -96,7 +135,8 @@ func (rf *Raft) GetState() (int, bool) {
 	var isleader bool
 
 	term = rf.currentTerm
-	isleader = rf.nextIndex != nil
+	isleader = rf.role == LEADER
+
 	return term, isleader
 }
 
@@ -168,8 +208,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 type RequestVoteArgs struct {
 	Term 			int // Candidate's term
 	CandidateID		int // Candidate that request vote
-	lastLogIndex	int // Index of candidate's last log entry
-	lastLogTerm		int // Term of candidate's last log entry
+	LastLogIndex	int // Index of candidate's last log entry
+	LastLogTerm		int // Term of candidate's last log entry
 	// Your data here (2A, 2B).
 }
 
@@ -179,7 +219,7 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	Term			int // currentTerm, for candidate to update itself
-	voteGranted		bool // True means the candidate received vote.
+	VoteGranted		bool // True means the candidate received vote.
 	// Your data here (2A).
 }
 
@@ -187,23 +227,26 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	rf.mu.Lock()
 	if args.Term < rf.currentTerm{
 		reply.Term = rf.currentTerm
-		reply.voteGranted = false
+		reply.VoteGranted = false
 	}else if args.Term == rf.currentTerm{
 		if rf.votedFor != -1{
 			reply.Term = rf.currentTerm
-			reply.voteGranted = false
+			reply.VoteGranted = false
 		}else{
 			rf.votedFor = args.CandidateID
 			reply.Term = args.Term
-			rf.currentTerm = args.Term
-			reply.voteGranted = true
+			reply.VoteGranted = true
 		}
 	}else{
-
+		rf.currentTerm = args.Term
+		rf.votedFor = args.CandidateID
+		rf.role = FOLLOWER
 	}
-	if args.
+	rf.mu.Unlock()
+	// TODO: The part of comparing term and index of logs.
 	// Your code here (2A, 2B).
 }
 
@@ -240,6 +283,43 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
+
+type AppendEntriesArgs struct{
+	// AppendEntries RPCs that carry no log entries is the heartbeat
+	Term			int			// Term of current leader
+	LeaderID		int			// ID of current leader
+
+	// TODO: add data record about entries. For heartBeat, we only need first two properties.
+}
+
+type AppendEntriesReply struct{
+	Term			int			// Term of the follower
+	Success			bool 		// TODO: used for matching entries
+}
+
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply){
+	// TODO: add entries passing
+	rf.mu.Lock()
+	if rf.role != FOLLOWER {
+		if args.Term >= rf.currentTerm {
+			rf.role = FOLLOWER
+			rf.currentTerm = args.Term
+			reply.Term = rf.currentTerm
+			reply.Success = true
+		} else {
+			reply.Term = rf.currentTerm
+			reply.Success = false
+		}
+	}
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
 
 
 //
@@ -291,11 +371,27 @@ func (rf *Raft) killed() bool {
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 func (rf *Raft) ticker() {
+	heartbeatTimeout := heartbeatCircle
+	electionTimeout := -1
 	for rf.killed() == false {
 
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
+		if rf.role == LEADER{
+			heartbeatArgs := AppendEntriesArgs{rf.currentTerm, rf.me}
+			for i := 0; i < len(rf.peers); i++{
+				heartbeatReply := AppendEntriesReply{}
+				if i == rf.me{
+					continue
+				}
+				rf.sendAppendEntries(i, &heartbeatArgs, &heartbeatReply)
+				// TODO: handle failed reply
+			}
+		}else if rf.role == FOLLOWER{
+
+		}
+
 
 	}
 }
@@ -314,10 +410,27 @@ func (rf *Raft) ticker() {
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
+	// basic properties
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.dead = 0
+	rf.role = FOLLOWER
 
+	// Update on stable storage before responding to RPC
+	rf.lastApplied = 0
+	rf.votedFor = -1
+	rf.currentTerm = 0
+	rf.committedIndex = 0
+	// Set default size of logs to 1000
+	rf.logs = make([]byte, defaultLogCapacity * int(unsafe.Sizeof(LogEntry{})))
+
+	// Reinitialized after election, only held by leaders.
+	rf.nextIndex = make([]int, len(peers))
+	rf.matchIndex = make([]int, len(peers))
+
+	// Other properties
+	rf.heartbeatCounter = heartbeatCircle
 	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash
