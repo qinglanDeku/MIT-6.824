@@ -18,10 +18,9 @@ package raft
 //
 
 import (
+	"labrpc"
 	"sync"
 	"sync/atomic"
-
-	"6.824/labrpc"
 )
 
 // import "bytes"
@@ -52,6 +51,14 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+type ServerRole int
+
+const (
+	FOLLOWER = iota
+
+)
+
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -61,6 +68,19 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
+
+	// Update on stable storage before responding to RPCs
+	currentTerm		int
+	votedFor		int				// ID of the raft this raft peer voted for.
+	logs			[]byte			// log entries, do not define for now.
+
+
+	committedIndex	int				// Index of highest entry known to be committed
+	lastApplied		int				// Index of
+
+	//Reinitialized after election, only held by leaders.
+	nextIndex[]		int 			// For each server, index of next log entry sent that
+	matchIndex[]	int				// For each server, index of highest log entry known to be replicated on server.
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -74,7 +94,9 @@ func (rf *Raft) GetState() (int, bool) {
 
 	var term int
 	var isleader bool
-	// Your code here (2A).
+
+	term = rf.currentTerm
+	isleader = rf.nextIndex != nil
 	return term, isleader
 }
 
@@ -144,6 +166,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
+	Term 			int // Candidate's term
+	CandidateID		int // Candidate that request vote
+	lastLogIndex	int // Index of candidate's last log entry
+	lastLogTerm		int // Term of candidate's last log entry
 	// Your data here (2A, 2B).
 }
 
@@ -152,6 +178,8 @@ type RequestVoteArgs struct {
 // field names must start with capital letters!
 //
 type RequestVoteReply struct {
+	Term			int // currentTerm, for candidate to update itself
+	voteGranted		bool // True means the candidate received vote.
 	// Your data here (2A).
 }
 
@@ -159,6 +187,23 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	if args.Term < rf.currentTerm{
+		reply.Term = rf.currentTerm
+		reply.voteGranted = false
+	}else if args.Term == rf.currentTerm{
+		if rf.votedFor != -1{
+			reply.Term = rf.currentTerm
+			reply.voteGranted = false
+		}else{
+			rf.votedFor = args.CandidateID
+			reply.Term = args.Term
+			rf.currentTerm = args.Term
+			reply.voteGranted = true
+		}
+	}else{
+
+	}
+	if args.
 	// Your code here (2A, 2B).
 }
 
