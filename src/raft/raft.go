@@ -35,10 +35,9 @@ import (
 
 // Some global values
 // Heartbeat period of leader to send, ms.
-var heartbeatCircle = 100
+var heartbeatCircle int64 = 120
 // Election timeout, ms.
-var electionTimeoutUpper = 450
-var electionTimeoutLower = 300
+var electionTimeoutLower = 200
 var defaultLogCapacity = 1000
 
 
@@ -119,7 +118,7 @@ type Raft struct {
 	matchIndex[]	int				// For each server, index of highest log entry known to be replicated on server.
 
 
-	heartbeatCounter	int			// A counter count for time span of heartbeat call
+	lastHeartbeatUnixTime		int64			// Record for the system time of last heartbeat (unix time nano)
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -134,8 +133,10 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 
+	rf.mu.Lock()
 	term = rf.currentTerm
 	isleader = rf.role == LEADER
+	rf.mu.Unlock()
 
 	return term, isleader
 }
@@ -227,6 +228,9 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	if rf.killed(){
+		return
+	}
 	rf.mu.Lock()
 	if args.Term < rf.currentTerm{
 		reply.Term = rf.currentTerm
@@ -237,13 +241,22 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.VoteGranted = false
 		}else{
 			rf.votedFor = args.CandidateID
+			rf.role = FOLLOWER
+			rf.currentTerm = args.Term
+			rf.lastHeartbeatUnixTime = time.Now().UnixNano()
 			reply.Term = args.Term
 			reply.VoteGranted = true
+			// log.Printf("line246: Peer %d voted for Peer %d", rf.me, args.CandidateID)
 		}
 	}else{
 		rf.currentTerm = args.Term
 		rf.votedFor = args.CandidateID
 		rf.role = FOLLOWER
+		rf.currentTerm = args.Term
+		rf.lastHeartbeatUnixTime = time.Now().UnixNano()
+		// log.Printf("line252: Peer %d voted for Peer %d", rf.me, args.CandidateID)
+		reply.Term = args.Term
+		reply.VoteGranted = true
 	}
 	rf.mu.Unlock()
 	// TODO: The part of comparing term and index of logs.
@@ -281,6 +294,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	// log.Printf("Peer %d received response from peer %d", rf.me, server)
 	return ok
 }
 
@@ -300,17 +314,35 @@ type AppendEntriesReply struct{
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply){
 	// TODO: add entries passing
+	if rf.killed(){
+		return
+	}
 	rf.mu.Lock()
 	if rf.role != FOLLOWER {
 		if args.Term >= rf.currentTerm {
 			rf.role = FOLLOWER
 			rf.currentTerm = args.Term
+			rf.lastHeartbeatUnixTime = time.Now().UnixNano()
 			reply.Term = rf.currentTerm
 			reply.Success = true
+			//// log.Printf("Peer %d receive heartbeat from Peer %d", rf.me, args.LeaderID)
 		} else {
 			reply.Term = rf.currentTerm
 			reply.Success = false
+			// log.Printf("Peer %d reject heartbeat from Peer %d", rf.me, args.LeaderID)
 		}
+	}else{
+		if args.Term >= rf.currentTerm{
+			rf.lastHeartbeatUnixTime = time.Now().UnixNano()
+			rf.currentTerm = args.Term
+			reply.Term = args.Term
+			reply.Success = true
+		}else{
+			reply.Term = rf.currentTerm
+			reply.Success = false
+			// log.Printf("Peer %d reject heartbeat from Peer %d", rf.me, args.LeaderID)
+		}
+		//// log.Printf("Peer %d receive heartbeat from Peer %d", rf.me, args.LeaderID)
 	}
 	rf.mu.Unlock()
 }
@@ -370,30 +402,185 @@ func (rf *Raft) killed() bool {
 
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
-func (rf *Raft) ticker() {
-	heartbeatTimeout := heartbeatCircle
-	electionTimeout := -1
-	for rf.killed() == false {
+// The paper's Section 5.2 mentions election timeouts in the range of 150 to 300 milliseconds.
+// Such a range only makes sense if the leader sends heartbeats considerably more often than once
+// per 150 milliseconds. Because the tester limits you to 10 heartbeats per second, you will have to
+// use an election timeout larger than the paper's 150 to 300 milliseconds, but not too large,
+// because then you may fail to elect a leader within five seconds.
 
+func (rf *Raft) distributeAppendEntries(args *AppendEntriesArgs){
+	for i := 0; i < len(rf.peers)&&!rf.killed(); i++{
+		appendEntriesReply := AppendEntriesReply{}
+		if i == rf.me{
+			continue
+		}
+		//// log.Printf("Peer %d send heartbeat to Peer %d", rf.me, i)
+		responseChan := make(chan int, len(rf.peers))
+		go func(reChan chan int, followerId int, sender *Raft, appendArg *AppendEntriesArgs,
+			reply *AppendEntriesReply){
+			if !sender.sendAppendEntries(followerId, appendArg, reply){
+				reChan <- -1
+				return
+			}
+			if reply.Success{
+				reChan <- 0
+			}else{
+				reChan <- reply.Term
+			}
+		}(responseChan, i, rf, args, &appendEntriesReply)
+		// TODO: handle failed reply when add log function in 2B
+		notALeader := false
+		for round:=1; round < len(rf.peers) && !notALeader; round++{
+			val := 0
+			select {
+				case val = <-responseChan:
+					rf.mu.Lock()
+					if val != 0 && rf.currentTerm < val{
+						rf.currentTerm = val
+						rf.role = FOLLOWER
+						notALeader = true
+					}
+					rf.mu.Unlock()
+					break
+				case <-time.After(time.Millisecond*time.Duration(heartbeatCircle/int64(len(rf.peers)))):
+					break
+			}
+		}
+	}
+	//// log.Printf("Peer %d finish a round of send heartbeat", rf.me)
+}
+
+func (rf *Raft) startElection(){
+	// Here we should start a new election
+	// Set a random election timeout to avoid split vote.
+	rf.mu.Lock()
+	rf.role = CANDIDATE
+	rf.currentTerm += 1
+	rf.lastHeartbeatUnixTime = time.Now().UnixNano()
+	requestArg := RequestVoteArgs{
+		rf.currentTerm,
+		rf.me,
+		0,
+		0}
+	// Begin to send RequestVote
+	rf.votedFor = rf.me
+	rf.mu.Unlock()
+	voteChan := make(chan int, len(rf.peers))
+
+	// send one vote request in one goroutine
+	for i := 0; i < len(rf.peers) && !rf.killed() && rf.me == rf.votedFor; i++ {
+		requestReply := RequestVoteReply{}
+		if i == rf.me{
+			continue
+		}
+		if rf.killed(){
+			break
+		}
+		// log.Printf("Peer %d request vote from peer %d", rf.me, i)
+		// First vote for self, 1 means votes
+		go func(voterId int, voteCh chan int, sender *Raft, args *RequestVoteArgs, reply *RequestVoteReply){
+			if !sender.sendRequestVote(voterId, args, reply){
+				// do not reply means do not vote
+				voteCh <- 2
+			}
+			if requestReply.VoteGranted{
+				voteCh <- 1
+			}else{
+				voteCh <- 2
+			}
+		}(i, voteChan, rf, &requestArg, &requestReply)
+	}
+
+	// Wait for the vote result, if timeout then the peer treat the other peer didn't vote for it.
+	beChosen 	:= 0
+	counter 	:= 1
+	votes		:= 1	// one votes for itself
+	for round:=0; round < len(rf.peers) &&  counter < len(rf.peers); round++ {
+		// log.Printf("Peer %d wait for votes result", rf.me)
+		val := 0
+		select{
+		case val = <-voteChan:
+			if val == 1{
+				votes += 1
+			}
+			counter += 1
+			break
+		case <-time.After(time.Millisecond*time.Duration(heartbeatCircle/int64(len(rf.peers)))):
+			counter += 1
+			break
+		}
+		// log.Printf("Peer %d receive %d votes", rf.me, votes)
+		if votes > len(rf.peers)/2{
+			beChosen = votes
+			break
+		}
+	}
+	rf.mu.Lock()
+	if beChosen != 0{
+		rf.role = LEADER
+		//log.Printf("Peer %d become leader, received %d votes, the term is %d", rf.me, beChosen,
+		//	rf.currentTerm)
+		appendEntriesArgs := AppendEntriesArgs{rf.currentTerm, rf.me}
+		rf.mu.Unlock()
+		if rf.killed(){
+			return
+		}
+		rf.distributeAppendEntries(&appendEntriesArgs)
+		//log.Printf("Peer %d is leader and finish first round of heartbeat!",
+		//	rf.me)
+	}else{
+		// log.Printf("Peer %d received %d votes and failed!", rf.me, beChosen)
+		rf.role = FOLLOWER
+		rf.votedFor = -1
+		rf.mu.Unlock()
+	}
+}
+
+
+func (rf *Raft) ticker() {
+	for rf.killed() == false {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
+		rf.mu.Lock()
 		if rf.role == LEADER{
-			heartbeatArgs := AppendEntriesArgs{rf.currentTerm, rf.me}
-			for i := 0; i < len(rf.peers); i++{
-				heartbeatReply := AppendEntriesReply{}
-				if i == rf.me{
+			appendEntriesArgs := AppendEntriesArgs{rf.currentTerm, rf.me}
+			rf.mu.Unlock()
+			if rf.killed(){
+				return
+			}
+			rf.distributeAppendEntries(&appendEntriesArgs)
+			//time.Sleep(time.Millisecond * time.Duration(rand.Intn(150) + 1))
+		}else if rf.role == FOLLOWER{
+			curSecond := time.Now().UnixNano()
+			difference := curSecond - rf.lastHeartbeatUnixTime
+			//// log.Printf("The time difference for  peer %d is %d", rf.me, difference)
+			if difference/(1000*1000) >= heartbeatCircle{
+				// Didn't hear from the leader for a 'long time', begin to start a new election
+				rf.mu.Unlock()
+				// log.Printf("Peer %d ready for election.\n", rf.me)
+				time.Sleep(time.Millisecond * time.Duration(rand.Intn(int(heartbeatCircle+1))+electionTimeoutLower))
+				rf.mu.Lock()
+				if rf.killed() || rf.lastHeartbeatUnixTime >= curSecond || rf.votedFor != -1{
+					rf.votedFor = -1
+					// log.Printf("Peer %d give up election.\n", rf.me)
+					rf.mu.Unlock()
 					continue
 				}
-				rf.sendAppendEntries(i, &heartbeatArgs, &heartbeatReply)
-				// TODO: handle failed reply
+				rf.mu.Unlock()
+				rf.startElection()
+				if rf.killed(){
+					break
+				}
+			}else{
+				rf.mu.Unlock()
+				time.Sleep(time.Millisecond * time.Duration(rand.Intn(int(heartbeatCircle)) + 1))
 			}
-		}else if rf.role == FOLLOWER{
 
 		}
-
-
 	}
+	//// log.Printf("Peer %d is killed.", rf.me)
+	return
 }
 
 //
@@ -430,11 +617,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, len(peers))
 
 	// Other properties
-	rf.heartbeatCounter = heartbeatCircle
+	rf.lastHeartbeatUnixTime = 0
 	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	// log.Printf("Successfully make peer %d.\n", rf.me)
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
