@@ -126,6 +126,14 @@ type Raft struct {
 
 }
 
+func (rf *Raft) GetVoteForLocked() int{
+	ret := 0
+	rf.mu.Lock()
+	ret = rf.votedFor
+	rf.mu.Unlock()
+	return ret
+}
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -246,7 +254,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.lastHeartbeatUnixTime = time.Now().UnixNano()
 			reply.Term = args.Term
 			reply.VoteGranted = true
-			// log.Printf("line246: Peer %d voted for Peer %d", rf.me, args.CandidateID)
+			//log.Printf("Peer %d voted for Peer %d", rf.me, args.CandidateID)
 		}
 	}else{
 		rf.currentTerm = args.Term
@@ -254,7 +262,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.role = FOLLOWER
 		rf.currentTerm = args.Term
 		rf.lastHeartbeatUnixTime = time.Now().UnixNano()
-		// log.Printf("line252: Peer %d voted for Peer %d", rf.me, args.CandidateID)
+		//log.Printf("Peer %d voted for Peer %d", rf.me, args.CandidateID)
 		reply.Term = args.Term
 		reply.VoteGranted = true
 	}
@@ -325,11 +333,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.lastHeartbeatUnixTime = time.Now().UnixNano()
 			reply.Term = rf.currentTerm
 			reply.Success = true
-			//// log.Printf("Peer %d receive heartbeat from Peer %d", rf.me, args.LeaderID)
+			//log.Printf("Peer %d receive heartbeat from Peer %d", rf.me, args.LeaderID)
 		} else {
 			reply.Term = rf.currentTerm
 			reply.Success = false
-			// log.Printf("Peer %d reject heartbeat from Peer %d", rf.me, args.LeaderID)
+			//log.Printf("Peer %d reject heartbeat from Peer %d", rf.me, args.LeaderID)
 		}
 	}else{
 		if args.Term >= rf.currentTerm{
@@ -337,10 +345,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.currentTerm = args.Term
 			reply.Term = args.Term
 			reply.Success = true
+			//log.Printf("Peer %d receive heartbeat from Peer %d", rf.me, args.LeaderID)
 		}else{
 			reply.Term = rf.currentTerm
 			reply.Success = false
-			// log.Printf("Peer %d reject heartbeat from Peer %d", rf.me, args.LeaderID)
+			//log.Printf("Peer %d reject heartbeat from Peer %d", rf.me, args.LeaderID)
 		}
 		//// log.Printf("Peer %d receive heartbeat from Peer %d", rf.me, args.LeaderID)
 	}
@@ -409,13 +418,13 @@ func (rf *Raft) killed() bool {
 // because then you may fail to elect a leader within five seconds.
 
 func (rf *Raft) distributeAppendEntries(args *AppendEntriesArgs){
+	responseChan := make(chan int, len(rf.peers))
 	for i := 0; i < len(rf.peers)&&!rf.killed(); i++{
 		appendEntriesReply := AppendEntriesReply{}
 		if i == rf.me{
 			continue
 		}
 		//// log.Printf("Peer %d send heartbeat to Peer %d", rf.me, i)
-		responseChan := make(chan int, len(rf.peers))
 		go func(reChan chan int, followerId int, sender *Raft, appendArg *AppendEntriesArgs,
 			reply *AppendEntriesReply){
 			if !sender.sendAppendEntries(followerId, appendArg, reply){
@@ -429,22 +438,22 @@ func (rf *Raft) distributeAppendEntries(args *AppendEntriesArgs){
 			}
 		}(responseChan, i, rf, args, &appendEntriesReply)
 		// TODO: handle failed reply when add log function in 2B
-		notALeader := false
-		for round:=1; round < len(rf.peers) && !notALeader; round++{
-			val := 0
-			select {
-				case val = <-responseChan:
-					rf.mu.Lock()
-					if val != 0 && rf.currentTerm < val{
-						rf.currentTerm = val
-						rf.role = FOLLOWER
-						notALeader = true
-					}
-					rf.mu.Unlock()
-					break
-				case <-time.After(time.Millisecond*time.Duration(heartbeatCircle/int64(len(rf.peers)))):
-					break
+	}
+	notALeader := false
+	for round:=1; round < len(rf.peers) && !notALeader; round++{
+		val := 0
+		select {
+		case val = <-responseChan:
+			rf.mu.Lock()
+			if val != 0 && rf.currentTerm < val{
+				rf.currentTerm = val
+				rf.role = FOLLOWER
+				notALeader = true
 			}
+			rf.mu.Unlock()
+			break
+		case <-time.After(time.Millisecond*time.Duration(heartbeatCircle/int64(len(rf.peers) + 2))):
+			break
 		}
 	}
 	//// log.Printf("Peer %d finish a round of send heartbeat", rf.me)
@@ -468,7 +477,7 @@ func (rf *Raft) startElection(){
 	voteChan := make(chan int, len(rf.peers))
 
 	// send one vote request in one goroutine
-	for i := 0; i < len(rf.peers) && !rf.killed() && rf.me == rf.votedFor; i++ {
+	for i := 0; i < len(rf.peers) && !rf.killed() && rf.me == rf.GetVoteForLocked(); i++ {
 		requestReply := RequestVoteReply{}
 		if i == rf.me{
 			continue
@@ -476,7 +485,7 @@ func (rf *Raft) startElection(){
 		if rf.killed(){
 			break
 		}
-		// log.Printf("Peer %d request vote from peer %d", rf.me, i)
+		//log.Printf("Peer %d request vote from peer %d", rf.me, i)
 		// First vote for self, 1 means votes
 		go func(voterId int, voteCh chan int, sender *Raft, args *RequestVoteArgs, reply *RequestVoteReply){
 			if !sender.sendRequestVote(voterId, args, reply){
@@ -509,7 +518,7 @@ func (rf *Raft) startElection(){
 			counter += 1
 			break
 		}
-		// log.Printf("Peer %d receive %d votes", rf.me, votes)
+		//log.Printf("Peer %d receive %d votes", rf.me, votes)
 		if votes > len(rf.peers)/2{
 			beChosen = votes
 			break
@@ -519,7 +528,7 @@ func (rf *Raft) startElection(){
 	if beChosen != 0{
 		rf.role = LEADER
 		//log.Printf("Peer %d become leader, received %d votes, the term is %d", rf.me, beChosen,
-		//	rf.currentTerm)
+			//rf.currentTerm)
 		appendEntriesArgs := AppendEntriesArgs{rf.currentTerm, rf.me}
 		rf.mu.Unlock()
 		if rf.killed(){
@@ -527,11 +536,10 @@ func (rf *Raft) startElection(){
 		}
 		rf.distributeAppendEntries(&appendEntriesArgs)
 		//log.Printf("Peer %d is leader and finish first round of heartbeat!",
-		//	rf.me)
+			//rf.me)
 	}else{
-		// log.Printf("Peer %d received %d votes and failed!", rf.me, beChosen)
+		//log.Printf("Peer %d received %d votes and failed!", rf.me, votes)
 		rf.role = FOLLOWER
-		rf.votedFor = -1
 		rf.mu.Unlock()
 	}
 }
@@ -554,17 +562,18 @@ func (rf *Raft) ticker() {
 		}else if rf.role == FOLLOWER{
 			curSecond := time.Now().UnixNano()
 			difference := curSecond - rf.lastHeartbeatUnixTime
-			//// log.Printf("The time difference for  peer %d is %d", rf.me, difference)
 			if difference/(1000*1000) >= heartbeatCircle{
+				//log.Printf("The time difference for  peer %d is %d", rf.me, difference)
 				// Didn't hear from the leader for a 'long time', begin to start a new election
+				rf.votedFor = -1
 				rf.mu.Unlock()
-				// log.Printf("Peer %d ready for election.\n", rf.me)
+				//log.Printf("Peer %d ready for election.\n", rf.me)
 				time.Sleep(time.Millisecond * time.Duration(rand.Intn(int(heartbeatCircle+1))+electionTimeoutLower))
 				rf.mu.Lock()
 				if rf.killed() || rf.lastHeartbeatUnixTime >= curSecond || rf.votedFor != -1{
-					rf.votedFor = -1
-					// log.Printf("Peer %d give up election.\n", rf.me)
+					//log.Printf("Peer %d give up election.\n", rf.me)
 					rf.mu.Unlock()
+					time.Sleep(time.Millisecond * time.Duration(int(heartbeatCircle)))
 					continue
 				}
 				rf.mu.Unlock()
@@ -574,7 +583,8 @@ func (rf *Raft) ticker() {
 				}
 			}else{
 				rf.mu.Unlock()
-				time.Sleep(time.Millisecond * time.Duration(rand.Intn(int(heartbeatCircle)) + 1))
+				time.Sleep(time.Millisecond * time.Duration(int(heartbeatCircle)))
+				//time.Sleep(time.Millisecond * time.Duration(rand.Intn(int(heartbeatCircle)) + 1))
 			}
 
 		}
