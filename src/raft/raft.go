@@ -277,8 +277,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				rf.lastHeartbeatUnixTime = time.Now().UnixNano()
 				reply.Term = args.Term
 				reply.VoteGranted = true
+				//log.Printf("Peer %d voted for Peer %d", rf.me, args.CandidateID)
 			}
-			//log.Printf("Peer %d voted for Peer %d", rf.me, args.CandidateID)
+
 		}
 	}else{
 		if len(rf.logs) == 1 || args.LastLogTerm > rf.logs[len(rf.logs)-1].Term ||
@@ -294,7 +295,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 	}
 	rf.mu.Unlock()
-	// TODO: The part of comparing term and index of logs.
 	// Your code here (2A, 2B).
 }
 
@@ -351,18 +351,33 @@ type AppendEntriesReply struct{
 
 func (rf*Raft) followerUpdateCommitIndex(args *AppendEntriesArgs){
 	if args.LeaderCommit > rf.committedIndex{
-		rf.committedIndex = int(math.Min(float64(args.LeaderCommit), float64(rf.logs[len(rf.logs)-1].Index)))
-	}
-	/* Apply log changes to tester too */
-	if args.Entries != nil{
-		for _, e := range args.Entries{
+		newCommitted := int(math.Min(float64(args.LeaderCommit), float64(rf.logs[len(rf.logs)-1].Index)))
+		/* Apply log changes to tester too */
+		newLogs := rf.logs[rf.committedIndex+1:newCommitted+1]
+		doChangeCommitted := false
+		for _, e := range newLogs{
 			rf.applyMessage2Tester(e)
+			doChangeCommitted = true
+		}
+		if doChangeCommitted{
+			/* Here we need to distinguish the heartbeat and non-heartbeat:
+			Since the heartbeat is used to exchange information about committed
+			log entries, but it may not actually change the committed entries,
+			so only change rf.committedIndex when there are new committed log entries
+			are apply to tester
+			*/
+			rf.committedIndex = args.LeaderCommit
 		}
 	}
+
 }
 
 /* Before call this function, the lock of 'rf' should be on! */
 func (rf*Raft) doAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply){
+	//log.Printf("Peer%d: arg prevlog term=%d, arg prevlog index index=%d, self last log term=%d, self last log " +
+	//	"index=%d \nnew entry first index=%d, new entry fisrt term=%d, committed index=%d", rf.me, args.PrevLogTerm,
+	//	args.PrevLogIndex, rf.logs[len(rf.logs)-1].Term, rf.logs[len(rf.logs)-1].Index, args.Entries[0].Index,
+	//	args.Entries[0].Term, rf.committedIndex)
 	if len(rf.logs) == 1{
 		if args.PrevLogIndex == 0{
 			reply.Success = true
@@ -440,7 +455,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			if args.Entries != nil{
 				rf.doAppendEntries(args, reply)
 			}else{
-				/* Heartbeat can also be used for update commit index */
+				/* Heartbeat  */
 				rf.followerUpdateCommitIndex(args)
 			}
 			//log.Printf("Peer %d receive heartbeat from Peer %d", rf.me, args.LeaderID)
@@ -482,6 +497,8 @@ func (rf *Raft)  applyMessage2Tester(logEntry LogEntry){
 	msg.CommandIndex = logEntry.Index
 	msg.Command = logEntry.Info
 	msg.CommandValid = true
+	//log.Printf("Peer%d apply log%d with command %d to tester", rf.me, logEntry.Index,
+	//	logEntry.Info)
 	rf.applyChan <- msg
 }
 
@@ -516,21 +533,21 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		// Index start from 1
 		newLogEntry := LogEntry{term, index, command}
 		rf.logs = append(rf.logs, newLogEntry)
-		rf.applyMessage2Tester(newLogEntry)
 	}
 	rf.mu.Unlock()
 	if isLeader{
 		for !rf.distributeAppendEntries(false) {
 			rf.mu.Lock()
 			if rf.killed(){
+				rf.mu.Unlock()
 				break
 			}
 			rf.mu.Unlock()
-			time.Sleep(time.Millisecond * 20)
+			time.Sleep(time.Millisecond * 10)
 		}
-		log.Printf("Leader%d return index:%d, term:%d", rf.me, index, term)
+		//log.Printf("Leader%d return index:%d, term:%d", rf.me, index, term)
 	}else{
-		log.Printf("Peer%d return index:%d, term:%d", rf.me, index, term)
+		//log.Printf("Peer%d return index:%d, term:%d", rf.me, index, term)
 	}
 
 	return index, term, isLeader
@@ -579,9 +596,20 @@ func (rf *Raft) leaderUpdateCommitIndex(){
 	//log.Printf("Leader%d's nextIndex[]:%d, matchIndex[]: %d", rf.me,
 	//	rf.nextIndex, rf.matchIndex)
 	for k, v := range commitIndexMap{
-		if v > (len(rf.peers) - 1)/2{
+		if v >= (len(rf.peers) - 1)/2{
 			if k > rf.committedIndex && rf.logs[k].Term == rf.currentTerm{
+				/* Apply the committed log to tester*/
+				newLogs := rf.logs[rf.committedIndex+1:k+1]
+				for _, l := range newLogs{
+					rf.applyMessage2Tester(l)
+				}
 				rf.committedIndex = k
+				//for i := 0; i < len(rf.peers); i++{
+				//	if i == rf.me{
+				//		continue
+				//	}
+				//	rf.nextIndex[i] = rf.committedIndex + 1
+				//}
 			}
 			break
 		}
@@ -656,11 +684,11 @@ func (rf *Raft) distributeAppendEntries(heartbeat bool) bool {
 						the only reason why the follower reject the appendEntriesRPC
 						is that the term of prevLogIndex in the follower doesn't match
 						prevLogTerm */
-						log.Printf("Peer%d rejet heartbeat from leader%d", val.ID,
-							rf.me)
+						//log.Printf("Peer%d rejet heartbeat from leader%d", val.ID,
+							//rf.me)
 					}else if val.Success < 0{
-						log.Printf( "Leader%d think peer%d lost connection", rf.me,
-							val.ID)
+						//log.Printf( "Leader%d think peer%d lost connection", rf.me,
+							//val.ID)
 					}
 					rf.mu.Unlock()
 				}else{
@@ -675,12 +703,16 @@ func (rf *Raft) distributeAppendEntries(heartbeat bool) bool {
 						is that the term of prevLogIndex in the follower doesn't match
 						prevLogTerm */
 						rf.nextIndex[val.ID] -= 1
+						//log.Printf("Peer%d failed to get new log entry, decrease nextIndex to% d",
+						//	val.ID, rf.nextIndex[val.ID])
 						tryAgain = true
 					}else if val.Success == 0{
-						rf.matchIndex[val.ID] =  rf.nextIndex[val.ID]
 						rf.nextIndex[val.ID] = rf.logs[len(rf.logs)-1].Index + 1
+						rf.matchIndex[val.ID] = rf.nextIndex[val.ID] - 1
 					}else{
 						/* lost connection with val.ID or server didn't reply in time */
+						//log.Printf( "Leader%d think peer%d lost connection", rf.me,
+							//val.ID)
 						tryAgain = true
 					}
 					rf.mu.Unlock()
@@ -774,8 +806,8 @@ func (rf *Raft) startElection(){
 		rf.turnToLeader()
 		/* Here the appendEntriesArgs are set for heartbeat */
 		rf.mu.Unlock()
-		log.Printf("Peer %d become leader, received %d votes, the term is %d", rf.me, beChosen,
-			rf.currentTerm)
+		//log.Printf("Peer %d become leader, received %d votes, the term is %d", rf.me, beChosen,
+			//rf.currentTerm)
 		if rf.killed(){
 			return
 		}
@@ -820,11 +852,11 @@ func (rf *Raft) ticker() {
 				// Didn't hear from the leader for a 'long time', begin to start a new election
 				rf.votedFor = -1
 				rf.mu.Unlock()
-				log.Printf("Peer %d ready for election.\n", rf.me)
+				//log.Printf("Peer %d ready for election.\n", rf.me)
 				time.Sleep(time.Millisecond * time.Duration(rand.Intn(int(heartbeatCircle+1))+electionTimeoutLower))
 				rf.mu.Lock()
 				if rf.killed() || rf.lastHeartbeatUnixTime >= curSecond || rf.votedFor != -1{
-					log.Printf("Peer %d give up election.\n", rf.me)
+					//log.Printf("Peer %d give up election.\n", rf.me)
 					rf.mu.Unlock()
 					time.Sleep(time.Millisecond * time.Duration(int(heartbeatCircle)))
 					continue
