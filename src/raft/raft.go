@@ -22,6 +22,7 @@ import (
 	"encoding/binary"
 	"labrpc"
 	"log"
+	"math"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -73,7 +74,9 @@ const (
 )
 
 type LogEntry struct{
-	term		int			// Term of this log entry
+	Term		int			// Term of this log entry
+	Index 		int			// Index of the log, begin from 1
+	Info		interface{}	// Unknown type of info
 	// todo: other data type will be added to stored main info of the log entry
 }
 
@@ -103,11 +106,12 @@ type Raft struct {
 	me        	int                 // this peer's index into peers[]
 	dead      	int32               // set by Kill()
 	role		ServerRole			// Role of this server in the cluster.
+	applyChan	chan ApplyMsg
 
 	// Update on stable storage before responding to RPC
 	currentTerm		int
 	votedFor		int				// ID of the raft this raft peer voted for.
-	logs			[]byte			// log entries, do not define for now.
+	logs			[]LogEntry			// log entries, do not define for now.
 
 
 	committedIndex	int				// Index of highest entry known to be committed
@@ -124,6 +128,23 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+}
+
+func (rf *Raft) turnToLeader() {
+	for i := range rf.nextIndex {
+		if i == rf.me {
+			continue
+		}
+		if len(rf.logs) == 1{
+			rf.nextIndex[i] = 1
+		}else{
+			rf.nextIndex[i] = rf.logs[len(rf.logs)-1].Index + 1
+			if rf.logs[len(rf.logs)-1].Index + 1 != len(rf.logs){
+				log.Printf("Wrong index!%d", len(rf.logs))
+			}
+		}
+		rf.matchIndex[i] = 0
+	}
 }
 
 func (rf *Raft) GetVoteForLocked() int{
@@ -310,7 +331,10 @@ type AppendEntriesArgs struct{
 	// AppendEntries RPCs that carry no log entries is the heartbeat
 	Term			int			// Term of current leader
 	LeaderID		int			// ID of current leader
-
+	PrevLogIndex	int			// Index of log entry immediately preceding new ones
+	PrevLogTerm		int			// Term of prevLogIndex entry
+	Entries			[]LogEntry	// Log entries for to store(empty for heartbeat, may send multiple for efficiency
+	LeaderCommit	int			// Leader's commit index
 	// TODO: add data record about entries. For heartBeat, we only need first two properties.
 }
 
@@ -319,9 +343,82 @@ type AppendEntriesReply struct{
 	Success			bool 		// TODO: used for matching entries
 }
 
+func (rf*Raft) followerUpdateCommitIndex(args *AppendEntriesArgs){
+	if args.LeaderCommit > rf.committedIndex{
+		rf.committedIndex = int(math.Min(float64(args.LeaderCommit), float64(rf.logs[len(rf.logs)-1].Index)))
+	}
+	/* Apply log changes to tester too */
+	if args.Entries != nil{
+		for _, e := range args.Entries{
+			rf.applyMessage2Tester(e)
+		}
+	}
+}
+
+/* Before call this function, the lock of 'rf' should be on! */
+func (rf*Raft) doAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply){
+	if len(rf.logs) == 1{
+		if args.PrevLogIndex == 0{
+			reply.Success = true
+			rf.logs = append(rf.logs, args.Entries...)
+			rf.followerUpdateCommitIndex(args)
+		}else{
+			/* If the server has no log but the leader has, then we need to add all
+			logs in leader to this server, but we should do it step
+			by step by using appendEntriesRPC and nextIndex[] go back */
+			reply.Success = false
+		}
+	}else{
+		if rf.logs[len(rf.logs)-1].Term == args.PrevLogTerm &&
+			rf.logs[len(rf.logs)-1].Index < args.PrevLogIndex{
+			/* If the server's log is behind the leaders in index, we need to find
+			the match point and add all entries after that point step
+			by step by using appendEntriesRPC and nextIndex[] go back */
+			reply.Success = false
+		}else if rf.logs[len(rf.logs)-1].Term == args.PrevLogTerm &&
+			rf.logs[len(rf.logs)-1].Index == args.PrevLogIndex{
+			/* Here we can apply new entries to the server. */
+			reply.Success = true
+			rf.logs = append(rf.logs, args.Entries...)
+			rf.followerUpdateCommitIndex(args)
+		}else if rf.logs[len(rf.logs)-1].Term == args.PrevLogTerm &&
+			rf.logs[len(rf.logs)-1].Index > args.PrevLogIndex{
+			/* If the server's log exceed the leaders(unlikely), remove all extra log
+			entries.*/
+			beginReplicatedLoc := -1
+			for i := len(rf.logs)-2; i > 0; i--{
+				if rf.logs[i].Index == args.PrevLogIndex && rf.logs[i].Term == args.PrevLogTerm{
+					beginReplicatedLoc = i
+					break
+				}
+			}
+			if beginReplicatedLoc != -1{
+				rf.logs = append(rf.logs[0: beginReplicatedLoc+1], args.Entries...)
+				reply.Success = true
+				rf.followerUpdateCommitIndex(args)
+			}else{
+				reply.Success = false
+			}
+		}else if rf.logs[len(rf.logs)-1].Term != args.PrevLogTerm{
+			/* If the server's log is behind the leaders in term, we need to find
+			the match point and add all entries after that point step
+			by step by using appendEntriesRPC and nextIndex[] go back. */
+			reply.Success = false
+			/* TODO: However, it is possible that the server has no common log
+			entries with leader(though it is very unlikely.) In this situation, need to
+			set a special method to copy whole log to the server */
+		}else{
+			/* Should not enter here !!!*/
+			log.Printf("Enter the wrong branch when append entries!")
+			reply.Success = false
+		}
+	}
+	//log.Printf("After append entries, the logs of peer %d is %d",
+		//rf.me, rf.logs)
+}
+
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply){
-	// TODO: add entries passing
 	if rf.killed(){
 		return
 	}
@@ -333,6 +430,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.lastHeartbeatUnixTime = time.Now().UnixNano()
 			reply.Term = rf.currentTerm
 			reply.Success = true
+			/* Not a heartbeat */
+			if args.Entries != nil{
+				rf.doAppendEntries(args, reply)
+			}else{
+				/* Heartbeat can also be used for update commit index */
+				rf.followerUpdateCommitIndex(args)
+			}
 			//log.Printf("Peer %d receive heartbeat from Peer %d", rf.me, args.LeaderID)
 		} else {
 			reply.Term = rf.currentTerm
@@ -345,6 +449,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.currentTerm = args.Term
 			reply.Term = args.Term
 			reply.Success = true
+			if args.Entries != nil{
+				rf.doAppendEntries(args, reply)
+			}else{
+				rf.followerUpdateCommitIndex(args)
+			}
 			//log.Printf("Peer %d receive heartbeat from Peer %d", rf.me, args.LeaderID)
 		}else{
 			reply.Term = rf.currentTerm
@@ -361,6 +470,14 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
+
+func (rf *Raft)  applyMessage2Tester(logEntry LogEntry){
+	msg := ApplyMsg{}
+	msg.CommandIndex = logEntry.Index
+	msg.Command = logEntry.Info
+	msg.CommandValid = true
+	rf.applyChan <- msg
+}
 
 
 //
@@ -380,10 +497,35 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	isLeader := true
-
+	rf.mu.Lock()
+	isLeader := rf.role == LEADER
 	// Your code here (2B).
-
+	if len(rf.logs) == 1{
+		index = 1
+	}else{
+		index = rf.logs[len(rf.logs)-1].Index + 1
+	}
+	term = rf.currentTerm
+	if isLeader{
+		// Index start from 1
+		newLogEntry := LogEntry{term, index, command}
+		rf.logs = append(rf.logs, newLogEntry)
+		rf.applyMessage2Tester(newLogEntry)
+	}
+	rf.mu.Unlock()
+	if isLeader{
+		for !rf.distributeAppendEntries(false) {
+			rf.mu.Lock()
+			if rf.killed(){
+				break
+			}
+			rf.mu.Unlock()
+			time.Sleep(time.Millisecond * 20)
+		}
+		log.Printf("Leader%d return index:%d, term:%d", rf.me, index, term)
+	}else{
+		log.Printf("Peer%d return index:%d, term:%d", rf.me, index, term)
+	}
 
 	return index, term, isLeader
 }
@@ -409,53 +551,146 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-// The ticker go routine starts a new election if this peer hasn't received
-// heartsbeats recently.
-// The paper's Section 5.2 mentions election timeouts in the range of 150 to 300 milliseconds.
-// Such a range only makes sense if the leader sends heartbeats considerably more often than once
-// per 150 milliseconds. Because the tester limits you to 10 heartbeats per second, you will have to
-// use an election timeout larger than the paper's 150 to 300 milliseconds, but not too large,
-// because then you may fail to elect a leader within five seconds.
+type AppendEntriesCallResponse struct{
+	Success 		int		/* 0 means success, integer greater than 0 represent
+								failed , -1 means server lost connection */
+	ID				int		/* ID of the response server */
+}
 
-func (rf *Raft) distributeAppendEntries(args *AppendEntriesArgs){
-	responseChan := make(chan int, len(rf.peers))
-	for i := 0; i < len(rf.peers)&&!rf.killed(); i++{
-		appendEntriesReply := AppendEntriesReply{}
+func (rf *Raft) leaderUpdateCommitIndex(){
+	commitIndexMap := make(map[int]int)
+	rf.mu.Lock()
+	for i := 0; i < len(rf.peers); i++{
 		if i == rf.me{
 			continue
 		}
-		//// log.Printf("Peer %d send heartbeat to Peer %d", rf.me, i)
-		go func(reChan chan int, followerId int, sender *Raft, appendArg *AppendEntriesArgs,
-			reply *AppendEntriesReply){
-			if !sender.sendAppendEntries(followerId, appendArg, reply){
-				reChan <- -1
-				return
-			}
-			if reply.Success{
-				reChan <- 0
-			}else{
-				reChan <- reply.Term
-			}
-		}(responseChan, i, rf, args, &appendEntriesReply)
-		// TODO: handle failed reply when add log function in 2B
+		if v, ok:= commitIndexMap[rf.matchIndex[i]]; ok{
+			commitIndexMap[rf.matchIndex[i]] = v + 1
+		}else{
+			commitIndexMap[rf.matchIndex[i]] = 1
+		}
 	}
-	notALeader := false
-	for round:=1; round < len(rf.peers) && !notALeader; round++{
-		val := 0
-		select {
-		case val = <-responseChan:
-			rf.mu.Lock()
-			if val != 0 && rf.currentTerm < val{
-				rf.currentTerm = val
-				rf.role = FOLLOWER
-				notALeader = true
+	for k, v := range commitIndexMap{
+		if v > (len(rf.peers) - 1)/2{
+			if k > rf.committedIndex && rf.logs[k-1].Term == rf.currentTerm{
+				rf.committedIndex = k
 			}
-			rf.mu.Unlock()
-			break
-		case <-time.After(time.Millisecond*time.Duration(heartbeatCircle/int64(len(rf.peers) + 2))):
 			break
 		}
 	}
+	rf.mu.Unlock()
+}
+
+/* return whether the appendEntries for all servers succeed, if not return false,
+and inform the leader to distribute again. If it is a heartbeat, then always return true.
+*/
+func (rf *Raft) distributeAppendEntries(heartbeat bool) bool {
+	responseChan := make(chan AppendEntriesCallResponse, len(rf.peers))
+	for i := 0; i < len(rf.peers)&&!rf.killed(); i++{
+		if i == rf.me{
+			continue
+		}
+		//log.Printf("Peer %d send heartbeat to Peer %d", rf.me, i)
+		rf.mu.Lock()
+		args := AppendEntriesArgs{
+			rf.currentTerm,
+			rf.me,
+			-1,
+			-1,
+			nil,
+			rf.committedIndex}
+		appendEntriesReply := AppendEntriesReply{}
+		if heartbeat{
+			args.Entries = nil
+		}else{
+			if rf.nextIndex[i] <= rf.logs[len(rf.logs)-1].Index{
+				args.Entries = rf.logs[rf.nextIndex[i]: len(rf.logs)]
+				args.PrevLogIndex = rf.logs[rf.nextIndex[i]-1].Index
+				args.PrevLogTerm = rf.logs[rf.nextIndex[i]-1].Term
+			}else{
+				/* If enter this branch means there are some servers but not this one
+				reject the leader or lost connection with the leader, then here
+				send a heartbeat to this server is enough since it doesn't need to apply
+				new logs */
+				args.Entries = nil
+			}
+		}
+		rf.mu.Unlock()
+		go func(reChan chan AppendEntriesCallResponse, followerId int, sender *Raft, appendArg *AppendEntriesArgs,
+			reply *AppendEntriesReply){
+			if !sender.sendAppendEntries(followerId, appendArg, reply){
+				reChan <- AppendEntriesCallResponse{-1, followerId}
+				return
+			}
+			if reply.Success{
+				reChan <- AppendEntriesCallResponse{0, followerId}
+			}else{
+				reChan <- AppendEntriesCallResponse{reply.Term, followerId}
+			}
+		}(responseChan, i, rf, &args, &appendEntriesReply)
+	}
+	notALeader := false
+	/* If normal append entries rpc didn't reach one of the servers, the
+	leader will retry to send the append entries rpc until all */
+	tryAgain := false
+	for round:=1; round < len(rf.peers) && !notALeader; round++{
+		var val AppendEntriesCallResponse
+		select {
+			case val = <-responseChan:
+				if heartbeat{
+					rf.mu.Lock()
+					if val.Success > 0 && rf.currentTerm < val.Success{
+						rf.currentTerm = val.Success
+						rf.role = FOLLOWER
+						notALeader = true
+					}else if val.Success > 0 && rf.currentTerm == val.Success{
+						/* If terms of leader and the follower are the same, then
+						the only reason why the follower reject the appendEntriesRPC
+						is that the term of prevLogIndex in the follower doesn't match
+						prevLogTerm */
+						log.Printf("Peer%d rejet heartbeat from leader%d", val.ID,
+							rf.me)
+					}else if val.Success < 0{
+						log.Printf( "Leader%d think peer%d lost connection", rf.me,
+							val.ID)
+					}
+					rf.mu.Unlock()
+				}else{
+					rf.mu.Lock()
+					if val.Success > 0 && rf.currentTerm < val.Success{
+						rf.currentTerm = val.Success
+						rf.role = FOLLOWER
+						notALeader = true
+					}else if val.Success > 0 && rf.currentTerm == val.Success{
+						/* If terms of leader and the follower are the same, then
+						the only reason why the follower reject the appendEntriesRPC
+						is that the term of prevLogIndex in the follower doesn't match
+						prevLogTerm */
+						rf.nextIndex[val.ID] -= 1
+						tryAgain = true
+					}else if val.Success == 0{
+						rf.nextIndex[val.ID] = rf.logs[len(rf.logs)-1].Index + 1
+						rf.matchIndex[val.ID] =  rf.nextIndex[val.ID] - 1
+					}else{
+						/* lost connection with val.ID or server didn't reply in time */
+						tryAgain = true
+					}
+					rf.mu.Unlock()
+				}
+				break
+			case <-time.After(time.Millisecond*time.Duration(heartbeatCircle/int64(len(rf.peers) + 2))):
+				/* lost connection with val.ID or server didn't reply in time */
+				/* TODO: Under this situation, does the leader need to retry send
+				AppendEntriesRPC */
+				break
+		}
+	}
+	rf.leaderUpdateCommitIndex()
+	if tryAgain && !heartbeat{
+		//log.Printf("Failed to distributed log entires, try again!")
+		return false
+	}
+	return true
 	//// log.Printf("Peer %d finish a round of send heartbeat", rf.me)
 }
 
@@ -527,14 +762,18 @@ func (rf *Raft) startElection(){
 	rf.mu.Lock()
 	if beChosen != 0{
 		rf.role = LEADER
-		//log.Printf("Peer %d become leader, received %d votes, the term is %d", rf.me, beChosen,
-			//rf.currentTerm)
-		appendEntriesArgs := AppendEntriesArgs{rf.currentTerm, rf.me}
+		/* Before send heartbeat, set all properties of the leader correctly */
+		rf.turnToLeader()
+		/* Here the appendEntriesArgs are set for heartbeat */
 		rf.mu.Unlock()
+		log.Printf("Peer %d become leader, received %d votes, the term is %d", rf.me, beChosen,
+			rf.currentTerm)
 		if rf.killed(){
 			return
 		}
-		rf.distributeAppendEntries(&appendEntriesArgs)
+		/* Send heartbeat twice since we need to wait the timeout of election */
+		rf.distributeAppendEntries( true)
+		rf.distributeAppendEntries( true)
 		//log.Printf("Peer %d is leader and finish first round of heartbeat!",
 			//rf.me)
 	}else{
@@ -544,7 +783,13 @@ func (rf *Raft) startElection(){
 	}
 }
 
-
+// The ticker go routine starts a new election if this peer hasn't received
+// heartsbeats recently.
+// The paper's Section 5.2 mentions election timeouts in the range of 150 to 300 milliseconds.
+// Such a range only makes sense if the leader sends heartbeats considerably more often than once
+// per 150 milliseconds. Because the tester limits you to 10 heartbeats per second, you will have to
+// use an election timeout larger than the paper's 150 to 300 milliseconds, but not too large,
+// because then you may fail to elect a leader within five seconds.
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
 		// Your code here to check if a leader election should
@@ -552,13 +797,13 @@ func (rf *Raft) ticker() {
 		// time.Sleep().
 		rf.mu.Lock()
 		if rf.role == LEADER{
-			appendEntriesArgs := AppendEntriesArgs{rf.currentTerm, rf.me}
+			/* Here send heartbeat, since no entry is appended. */
 			rf.mu.Unlock()
 			if rf.killed(){
 				return
 			}
-			rf.distributeAppendEntries(&appendEntriesArgs)
-			//time.Sleep(time.Millisecond * time.Duration(rand.Intn(150) + 1))
+			rf.distributeAppendEntries( true)
+			time.Sleep(time.Millisecond * time.Duration(int(heartbeatCircle)/len(rf.peers)))
 		}else if rf.role == FOLLOWER{
 			curSecond := time.Now().UnixNano()
 			difference := curSecond - rf.lastHeartbeatUnixTime
@@ -567,11 +812,11 @@ func (rf *Raft) ticker() {
 				// Didn't hear from the leader for a 'long time', begin to start a new election
 				rf.votedFor = -1
 				rf.mu.Unlock()
-				//log.Printf("Peer %d ready for election.\n", rf.me)
+				log.Printf("Peer %d ready for election.\n", rf.me)
 				time.Sleep(time.Millisecond * time.Duration(rand.Intn(int(heartbeatCircle+1))+electionTimeoutLower))
 				rf.mu.Lock()
 				if rf.killed() || rf.lastHeartbeatUnixTime >= curSecond || rf.votedFor != -1{
-					//log.Printf("Peer %d give up election.\n", rf.me)
+					log.Printf("Peer %d give up election.\n", rf.me)
 					rf.mu.Unlock()
 					time.Sleep(time.Millisecond * time.Duration(int(heartbeatCircle)))
 					continue
@@ -583,10 +828,9 @@ func (rf *Raft) ticker() {
 				}
 			}else{
 				rf.mu.Unlock()
-				time.Sleep(time.Millisecond * time.Duration(int(heartbeatCircle)))
 				//time.Sleep(time.Millisecond * time.Duration(rand.Intn(int(heartbeatCircle)) + 1))
 			}
-
+			time.Sleep(time.Millisecond * time.Duration(int(heartbeatCircle)))
 		}
 	}
 	//// log.Printf("Peer %d is killed.", rf.me)
@@ -613,6 +857,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 	rf.dead = 0
 	rf.role = FOLLOWER
+	rf.applyChan = applyCh
 
 	// Update on stable storage before responding to RPC
 	rf.lastApplied = 0
@@ -620,7 +865,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.committedIndex = 0
 	// Set default size of logs to 1000
-	rf.logs = make([]byte, defaultLogCapacity * int(unsafe.Sizeof(LogEntry{})))
+	rf.logs = make([]LogEntry, 0, defaultLogCapacity)
+	// Add an empty log entry for holding the 0-index place
+	rf.logs = append(rf.logs, LogEntry{-1, 0 , -1})
+	initApplyMsg := ApplyMsg{}
+	initApplyMsg.Command = -1
+	initApplyMsg.CommandValid = true
+	initApplyMsg.CommandIndex = 0
+	rf.applyChan <- initApplyMsg
 
 	// Reinitialized after election, only held by leaders.
 	rf.nextIndex = make([]int, len(peers))
