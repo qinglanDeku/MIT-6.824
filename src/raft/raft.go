@@ -269,23 +269,29 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.Term = rf.currentTerm
 			reply.VoteGranted = false
 		}else{
+			if len(rf.logs) == 1 || args.LastLogTerm > rf.logs[len(rf.logs)-1].Term ||
+				(args.LastLogTerm == rf.logs[len(rf.logs)-1].Term && args.LastLogIndex > rf.logs[len(rf.logs)-1].Index){
+				rf.votedFor = args.CandidateID
+				rf.role = FOLLOWER
+				rf.currentTerm = args.Term
+				rf.lastHeartbeatUnixTime = time.Now().UnixNano()
+				reply.Term = args.Term
+				reply.VoteGranted = true
+			}
+			//log.Printf("Peer %d voted for Peer %d", rf.me, args.CandidateID)
+		}
+	}else{
+		if len(rf.logs) == 1 || args.LastLogTerm > rf.logs[len(rf.logs)-1].Term ||
+			(args.LastLogTerm == rf.logs[len(rf.logs)-1].Term && args.LastLogIndex > rf.logs[len(rf.logs)-1].Index) {
+			rf.currentTerm = args.Term
 			rf.votedFor = args.CandidateID
 			rf.role = FOLLOWER
 			rf.currentTerm = args.Term
 			rf.lastHeartbeatUnixTime = time.Now().UnixNano()
+			//log.Printf("Peer %d voted for Peer %d", rf.me, args.CandidateID)
 			reply.Term = args.Term
 			reply.VoteGranted = true
-			//log.Printf("Peer %d voted for Peer %d", rf.me, args.CandidateID)
 		}
-	}else{
-		rf.currentTerm = args.Term
-		rf.votedFor = args.CandidateID
-		rf.role = FOLLOWER
-		rf.currentTerm = args.Term
-		rf.lastHeartbeatUnixTime = time.Now().UnixNano()
-		//log.Printf("Peer %d voted for Peer %d", rf.me, args.CandidateID)
-		reply.Term = args.Term
-		reply.VoteGranted = true
 	}
 	rf.mu.Unlock()
 	// TODO: The part of comparing term and index of logs.
@@ -570,9 +576,11 @@ func (rf *Raft) leaderUpdateCommitIndex(){
 			commitIndexMap[rf.matchIndex[i]] = 1
 		}
 	}
+	//log.Printf("Leader%d's nextIndex[]:%d, matchIndex[]: %d", rf.me,
+	//	rf.nextIndex, rf.matchIndex)
 	for k, v := range commitIndexMap{
 		if v > (len(rf.peers) - 1)/2{
-			if k > rf.committedIndex && rf.logs[k-1].Term == rf.currentTerm{
+			if k > rf.committedIndex && rf.logs[k].Term == rf.currentTerm{
 				rf.committedIndex = k
 			}
 			break
@@ -669,8 +677,8 @@ func (rf *Raft) distributeAppendEntries(heartbeat bool) bool {
 						rf.nextIndex[val.ID] -= 1
 						tryAgain = true
 					}else if val.Success == 0{
+						rf.matchIndex[val.ID] =  rf.nextIndex[val.ID]
 						rf.nextIndex[val.ID] = rf.logs[len(rf.logs)-1].Index + 1
-						rf.matchIndex[val.ID] =  rf.nextIndex[val.ID] - 1
 					}else{
 						/* lost connection with val.ID or server didn't reply in time */
 						tryAgain = true
@@ -704,8 +712,8 @@ func (rf *Raft) startElection(){
 	requestArg := RequestVoteArgs{
 		rf.currentTerm,
 		rf.me,
-		0,
-		0}
+		rf.logs[len(rf.logs)-1].Index,
+		rf.logs[len(rf.logs)-1].Term}
 	// Begin to send RequestVote
 	rf.votedFor = rf.me
 	rf.mu.Unlock()
