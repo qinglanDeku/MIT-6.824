@@ -43,7 +43,7 @@ var electionTimeoutLower = 200
 var defaultLogCapacity = 1000
 
 // debug triggers
-var electionDebugEnable =false
+var electionDebugEnable = false
 var replicationDebugEnable = false
 
 func electionDebug(s string){
@@ -788,12 +788,12 @@ func (rf *Raft) startElection(){
 		go func(voterId int, voteCh chan int, sender *Raft, args *RequestVoteArgs, reply *RequestVoteReply){
 			if !sender.sendRequestVote(voterId, args, reply){
 				// do not reply means do not vote
-				voteCh <- 2
+				voteCh <- -1
 			}
 			if requestReply.VoteGranted{
 				voteCh <- 1
 			}else{
-				voteCh <- 2
+				voteCh <- requestReply.Term
 			}
 		}(i, voteChan, rf, &requestArg, &requestReply)
 	}
@@ -809,6 +809,17 @@ func (rf *Raft) startElection(){
 		case val = <-voteChan:
 			if val == 1{
 				votes += 1
+			}else if val <= 0{
+				// has no reply from voter
+			}else{
+				rf.mu.Lock()
+				if val > rf.currentTerm{
+					rf.currentTerm = val
+					rf.role = FOLLOWER
+					rf.mu.Unlock()
+					break
+				}
+				rf.mu.Unlock()
 			}
 			counter += 1
 			break
@@ -844,6 +855,7 @@ func (rf *Raft) startElection(){
 		electionDebug(fmt.Sprintf("Peer %d received %d votes and failed!", rf.me, votes))
 		rf.role = FOLLOWER
 		rf.mu.Unlock()
+		time.Sleep(time.Millisecond * 20)
 	}
 }
 
