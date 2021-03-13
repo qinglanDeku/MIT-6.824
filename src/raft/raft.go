@@ -20,6 +20,7 @@ package raft
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"labrpc"
 	"log"
 	"math"
@@ -40,6 +41,22 @@ var heartbeatCircle int64 = 120
 // Election timeout, ms.
 var electionTimeoutLower = 200
 var defaultLogCapacity = 1000
+
+// debug triggers
+var electionDebugEnable = false
+var replicationDebugEnable = false
+
+func electionDebug(s string){
+	if electionDebugEnable{
+		log.Print(s)
+	}
+}
+
+func replicationDebug(s string){
+	if replicationDebugEnable{
+		log.Print(s)
+	}
+}
 
 
 //
@@ -378,6 +395,8 @@ func (rf*Raft) doAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRepl
 	//	"index=%d \nnew entry first index=%d, new entry fisrt term=%d, committed index=%d", rf.me, args.PrevLogTerm,
 	//	args.PrevLogIndex, rf.logs[len(rf.logs)-1].Term, rf.logs[len(rf.logs)-1].Index, args.Entries[0].Index,
 	//	args.Entries[0].Term, rf.committedIndex)
+	replicationDebug(fmt.Sprint("Peer ", rf.me, "  PrevLogTerm:", args.PrevLogTerm, "  PrevLogIndex: ", args.PrevLogIndex,
+		"  newEntries: ", args.Entries, "  origin logs: ", rf.logs))
 	if len(rf.logs) == 1{
 		if args.PrevLogIndex == 0{
 			reply.Success = true
@@ -533,21 +552,17 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		// Index start from 1
 		newLogEntry := LogEntry{term, index, command}
 		rf.logs = append(rf.logs, newLogEntry)
-	}
-	rf.mu.Unlock()
-	if isLeader{
 		for !rf.distributeAppendEntries(false) {
-			rf.mu.Lock()
 			if rf.killed(){
-				rf.mu.Unlock()
 				break
 			}
-			rf.mu.Unlock()
 			time.Sleep(time.Millisecond * 10)
 		}
-		//log.Printf("Leader%d return index:%d, term:%d", rf.me, index, term)
+		rf.mu.Unlock()
+		replicationDebug(fmt.Sprintf("Leader%d return index:%d, term:%d", rf.me, index, term))
 	}else{
-		//log.Printf("Peer%d return index:%d, term:%d", rf.me, index, term)
+		rf.mu.Unlock()
+		replicationDebug(fmt.Sprintf("Peer%d return index:%d, term:%d", rf.me, index, term))
 	}
 
 	return index, term, isLeader
@@ -582,7 +597,6 @@ type AppendEntriesCallResponse struct{
 
 func (rf *Raft) leaderUpdateCommitIndex(){
 	commitIndexMap := make(map[int]int)
-	rf.mu.Lock()
 	for i := 0; i < len(rf.peers); i++{
 		if i == rf.me{
 			continue
@@ -590,13 +604,11 @@ func (rf *Raft) leaderUpdateCommitIndex(){
 		if v, ok:= commitIndexMap[rf.matchIndex[i]]; ok{
 			commitIndexMap[rf.matchIndex[i]] = v + 1
 		}else{
-			commitIndexMap[rf.matchIndex[i]] = 1
+			commitIndexMap[rf.matchIndex[i]] = 2
 		}
 	}
-	//log.Printf("Leader%d's nextIndex[]:%d, matchIndex[]: %d", rf.me,
-	//	rf.nextIndex, rf.matchIndex)
 	for k, v := range commitIndexMap{
-		if v >= (len(rf.peers) - 1)/2{
+		if v > (len(rf.peers) - 1)/2{
 			if k > rf.committedIndex && rf.logs[k].Term == rf.currentTerm{
 				/* Apply the committed log to tester*/
 				newLogs := rf.logs[rf.committedIndex+1:k+1]
@@ -604,6 +616,8 @@ func (rf *Raft) leaderUpdateCommitIndex(){
 					rf.applyMessage2Tester(l)
 				}
 				rf.committedIndex = k
+				replicationDebug(fmt.Sprintf("Leader%d's nextIndex[]:%d, matchIndex[]: %d", rf.me,
+					rf.nextIndex, rf.matchIndex))
 				//for i := 0; i < len(rf.peers); i++{
 				//	if i == rf.me{
 				//		continue
@@ -614,7 +628,6 @@ func (rf *Raft) leaderUpdateCommitIndex(){
 			break
 		}
 	}
-	rf.mu.Unlock()
 }
 
 /* return whether the appendEntries for all servers succeed, if not return false,
@@ -622,12 +635,15 @@ and inform the leader to distribute again. If it is a heartbeat, then always ret
 */
 func (rf *Raft) distributeAppendEntries(heartbeat bool) bool {
 	responseChan := make(chan AppendEntriesCallResponse, len(rf.peers))
+	if heartbeat{
+		rf.mu.Lock()
+	}
 	for i := 0; i < len(rf.peers)&&!rf.killed(); i++{
 		if i == rf.me{
 			continue
 		}
 		//log.Printf("Peer %d send heartbeat to Peer %d", rf.me, i)
-		rf.mu.Lock()
+
 		args := AppendEntriesArgs{
 			rf.currentTerm,
 			rf.me,
@@ -651,7 +667,6 @@ func (rf *Raft) distributeAppendEntries(heartbeat bool) bool {
 				args.Entries = nil
 			}
 		}
-		rf.mu.Unlock()
 		go func(reChan chan AppendEntriesCallResponse, followerId int, sender *Raft, appendArg *AppendEntriesArgs,
 			reply *AppendEntriesReply){
 			if !sender.sendAppendEntries(followerId, appendArg, reply){
@@ -674,7 +689,7 @@ func (rf *Raft) distributeAppendEntries(heartbeat bool) bool {
 		select {
 			case val = <-responseChan:
 				if heartbeat{
-					rf.mu.Lock()
+
 					if val.Success > 0 && rf.currentTerm < val.Success{
 						rf.currentTerm = val.Success
 						rf.role = FOLLOWER
@@ -690,9 +705,7 @@ func (rf *Raft) distributeAppendEntries(heartbeat bool) bool {
 						//log.Printf( "Leader%d think peer%d lost connection", rf.me,
 							//val.ID)
 					}
-					rf.mu.Unlock()
 				}else{
-					rf.mu.Lock()
 					if val.Success > 0 && rf.currentTerm < val.Success{
 						rf.currentTerm = val.Success
 						rf.role = FOLLOWER
@@ -703,8 +716,8 @@ func (rf *Raft) distributeAppendEntries(heartbeat bool) bool {
 						is that the term of prevLogIndex in the follower doesn't match
 						prevLogTerm */
 						rf.nextIndex[val.ID] -= 1
-						//log.Printf("Peer%d failed to get new log entry, decrease nextIndex to% d",
-						//	val.ID, rf.nextIndex[val.ID])
+						replicationDebug(fmt.Sprintf("Peer%d failed to get new log entry, decrease nextIndex to% d",
+							val.ID, rf.nextIndex[val.ID]))
 						tryAgain = true
 					}else if val.Success == 0{
 						rf.nextIndex[val.ID] = rf.logs[len(rf.logs)-1].Index + 1
@@ -715,7 +728,6 @@ func (rf *Raft) distributeAppendEntries(heartbeat bool) bool {
 							//val.ID)
 						tryAgain = true
 					}
-					rf.mu.Unlock()
 				}
 				break
 			case <-time.After(time.Millisecond*time.Duration(heartbeatCircle/int64(len(rf.peers) + 2))):
@@ -726,6 +738,9 @@ func (rf *Raft) distributeAppendEntries(heartbeat bool) bool {
 		}
 	}
 	rf.leaderUpdateCommitIndex()
+	if heartbeat{
+		rf.mu.Unlock()
+	}
 	if tryAgain && !heartbeat{
 		//log.Printf("Failed to distributed log entires, try again!")
 		return false
@@ -806,8 +821,8 @@ func (rf *Raft) startElection(){
 		rf.turnToLeader()
 		/* Here the appendEntriesArgs are set for heartbeat */
 		rf.mu.Unlock()
-		//log.Printf("Peer %d become leader, received %d votes, the term is %d", rf.me, beChosen,
-			//rf.currentTerm)
+		electionDebug(fmt.Sprintf("Peer %d become leader, received %d votes, the term is %d", rf.me, beChosen,
+			rf.currentTerm))
 		if rf.killed(){
 			return
 		}
@@ -856,7 +871,7 @@ func (rf *Raft) ticker() {
 				time.Sleep(time.Millisecond * time.Duration(rand.Intn(int(heartbeatCircle+1))+electionTimeoutLower))
 				rf.mu.Lock()
 				if rf.killed() || rf.lastHeartbeatUnixTime >= curSecond || rf.votedFor != -1{
-					//log.Printf("Peer %d give up election.\n", rf.me)
+					electionDebug(fmt.Sprintf("Peer %d give up election.\n", rf.me))
 					rf.mu.Unlock()
 					time.Sleep(time.Millisecond * time.Duration(int(heartbeatCircle)))
 					continue
