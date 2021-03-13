@@ -37,13 +37,13 @@ import (
 
 // Some global values
 // Heartbeat period of leader to send, ms.
-var heartbeatCircle int64 = 120
+var heartbeatCircle int64 = 100
 // Election timeout, ms.
 var electionTimeoutLower = 200
 var defaultLogCapacity = 1000
 
 // debug triggers
-var electionDebugEnable = false
+var electionDebugEnable =false
 var replicationDebugEnable = false
 
 func electionDebug(s string){
@@ -271,7 +271,7 @@ type RequestVoteReply struct {
 }
 
 //
-// example RequestVote RPC handler.
+// RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if rf.killed(){
@@ -287,7 +287,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.VoteGranted = false
 		}else{
 			if len(rf.logs) == 1 || args.LastLogTerm > rf.logs[len(rf.logs)-1].Term ||
-				(args.LastLogTerm == rf.logs[len(rf.logs)-1].Term && args.LastLogIndex > rf.logs[len(rf.logs)-1].Index){
+				(args.LastLogTerm == rf.logs[len(rf.logs)-1].Term && args.LastLogIndex >= rf.logs[len(rf.logs)-1].Index){
 				rf.votedFor = args.CandidateID
 				rf.role = FOLLOWER
 				rf.currentTerm = args.Term
@@ -300,7 +300,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 	}else{
 		if len(rf.logs) == 1 || args.LastLogTerm > rf.logs[len(rf.logs)-1].Term ||
-			(args.LastLogTerm == rf.logs[len(rf.logs)-1].Term && args.LastLogIndex > rf.logs[len(rf.logs)-1].Index) {
+			(args.LastLogTerm == rf.logs[len(rf.logs)-1].Term && args.LastLogIndex >= rf.logs[len(rf.logs)-1].Index) {
 			rf.currentTerm = args.Term
 			rf.votedFor = args.CandidateID
 			rf.role = FOLLOWER
@@ -373,6 +373,14 @@ func (rf*Raft) followerUpdateCommitIndex(args *AppendEntriesArgs){
 		newLogs := rf.logs[rf.committedIndex+1:newCommitted+1]
 		doChangeCommitted := false
 		for _, e := range newLogs{
+			/* 	Test2BReJoin: HeartBeat before really distributed some entries may pass a false
+			information telling the raft to committed entries that was not existed in the
+			current leader's log. For example, a reconnected previous leader may has different log in
+			new leader's committedIndex, a heartbeat like this may apply wrong data to state
+			machine! , so we need to check the log entry's term */
+			if args.Entries == nil && e.Term < rf.currentTerm{
+				break
+			}
 			rf.applyMessage2Tester(e)
 			doChangeCommitted = true
 		}
@@ -516,8 +524,8 @@ func (rf *Raft)  applyMessage2Tester(logEntry LogEntry){
 	msg.CommandIndex = logEntry.Index
 	msg.Command = logEntry.Info
 	msg.CommandValid = true
-	//log.Printf("Peer%d apply log%d with command %d to tester", rf.me, logEntry.Index,
-	//	logEntry.Info)
+	replicationDebug(fmt.Sprintf("Peer%d(%d) apply log%d with command %d to tester", rf.me, rf.role,
+		logEntry.Index,	logEntry.Info))
 	rf.applyChan <- msg
 }
 
@@ -827,12 +835,13 @@ func (rf *Raft) startElection(){
 			return
 		}
 		/* Send heartbeat twice since we need to wait the timeout of election */
+
 		rf.distributeAppendEntries( true)
 		rf.distributeAppendEntries( true)
 		//log.Printf("Peer %d is leader and finish first round of heartbeat!",
 			//rf.me)
 	}else{
-		//log.Printf("Peer %d received %d votes and failed!", rf.me, votes)
+		electionDebug(fmt.Sprintf("Peer %d received %d votes and failed!", rf.me, votes))
 		rf.role = FOLLOWER
 		rf.mu.Unlock()
 	}
@@ -867,7 +876,7 @@ func (rf *Raft) ticker() {
 				// Didn't hear from the leader for a 'long time', begin to start a new election
 				rf.votedFor = -1
 				rf.mu.Unlock()
-				//log.Printf("Peer %d ready for election.\n", rf.me)
+				electionDebug(fmt.Sprintf("Peer %d ready for election.\n", rf.me))
 				time.Sleep(time.Millisecond * time.Duration(rand.Intn(int(heartbeatCircle+1))+electionTimeoutLower))
 				rf.mu.Lock()
 				if rf.killed() || rf.lastHeartbeatUnixTime >= curSecond || rf.votedFor != -1{
