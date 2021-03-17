@@ -904,9 +904,10 @@ func (rf *Raft) ticker() {
 				}
 			}else{
 				rf.mu.Unlock()
+				time.Sleep(time.Millisecond * time.Duration(int(heartbeatCircle)))
 				//time.Sleep(time.Millisecond * time.Duration(rand.Intn(int(heartbeatCircle)) + 1))
 			}
-			time.Sleep(time.Millisecond * time.Duration(int(heartbeatCircle)))
+
 		}
 	}
 	//// log.Printf("Peer %d is killed.", rf.me)
