@@ -329,7 +329,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				rf.lastHeartbeatUnixTime = time.Now().UnixNano()
 				reply.Term = args.Term
 				reply.VoteGranted = true
-				//log.Printf("Peer %d voted for Peer %d", rf.me, args.CandidateID)
+				electionDebug(fmt.Sprintf("Peer %d voted for Peer %d", rf.me, args.CandidateID))
 			}
 
 		}
@@ -341,7 +341,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.CurrentTerm = args.Term
 			rf.persist()
 			rf.lastHeartbeatUnixTime = time.Now().UnixNano()
-			//log.Printf("Peer %d voted for Peer %d", rf.me, args.CandidateID)
+			electionDebug(fmt.Sprintf("Peer %d voted for Peer %d", rf.me, args.CandidateID))
 			reply.Term = args.Term
 			reply.VoteGranted = true
 		}
@@ -489,7 +489,16 @@ func (rf*Raft) doAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRepl
 			/* If the server's log is behind the leaders in term, we need to find
 			the match point and add all entries after that point step
 			by step by using appendEntriesRPC and nextIndex[] go back. */
-			reply.Success = false
+			if args.PrevLogTerm == -1{
+				/* This means that the follower should apply all new entries to
+				its Logs. */
+				rf.Logs = append(rf.Logs[0:1], args.Entries...)
+				rf.persist()
+				reply.Success = true
+				rf.followerUpdateCommitIndex(args)
+			}else{
+				reply.Success = false
+			}
 			/* TODO: However, it is possible that the server has no common log
 			entries with leader(though it is very unlikely.) In this situation, need to
 			set a special method to copy whole log to the server */
@@ -512,6 +521,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if rf.role != FOLLOWER {
 		if args.Term >= rf.CurrentTerm {
 			rf.role = FOLLOWER
+			rf.VotedFor = args.LeaderID
 			rf.CurrentTerm = args.Term
 			rf.persist()
 			rf.lastHeartbeatUnixTime = time.Now().UnixNano()
@@ -537,6 +547,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}else{
 		if args.Term >= rf.CurrentTerm {
 			rf.lastHeartbeatUnixTime = time.Now().UnixNano()
+			rf.VotedFor = args.LeaderID
 			rf.CurrentTerm = args.Term
 			rf.persist()
 			reply.Term = args.Term
@@ -853,7 +864,7 @@ func (rf *Raft) startElection(){
 				voteCh <- -1
 			}
 			if requestReply.VoteGranted{
-				voteCh <- 1
+				voteCh <- -2
 			}else{
 				voteCh <- requestReply.Term
 			}
@@ -869,9 +880,9 @@ func (rf *Raft) startElection(){
 		val := 0
 		select{
 		case val = <-voteChan:
-			if val == 1{
+			if val == -2{
 				votes += 1
-			}else if val <= 0{
+			}else if val == -1{
 				// has no reply from voter
 			}else{
 				rf.mu.Lock()
@@ -966,7 +977,7 @@ func (rf *Raft) ticker() {
 				if rf.killed() || rf.lastHeartbeatUnixTime >= curSecond || rf.VotedFor != -1{
 					electionDebug(fmt.Sprintf("Peer %d give up election.\n", rf.me))
 					rf.mu.Unlock()
-					time.Sleep(time.Millisecond * time.Duration(int(heartbeatCircle)))
+					time.Sleep(time.Millisecond * time.Duration(rand.Intn(int(heartbeatCircle))))
 					continue
 				}
 				rf.mu.Unlock()
