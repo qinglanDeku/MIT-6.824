@@ -426,7 +426,7 @@ func (rf*Raft) followerUpdateCommitIndex(args *AppendEntriesArgs){
 			so only change rf.committedIndex when there are new committed log entries
 			are apply to tester
 			*/
-			rf.committedIndex = args.LeaderCommit
+			rf.committedIndex = newCommitted
 		}
 	}
 
@@ -522,7 +522,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				rf.doAppendEntries(args, reply)
 			}else{
 				/* Heartbeat  */
-				rf.followerUpdateCommitIndex(args)
+				if rf.Logs[len(rf.Logs)-1].Index <= args.PrevLogIndex{
+					reply.Success = false
+				}else {
+					rf.followerUpdateCommitIndex(args)
+				}
 			}
 			//log.Printf("Peer %d receive heartbeat from Peer %d", rf.me, args.LeaderID)
 		} else {
@@ -540,7 +544,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			if args.Entries != nil{
 				rf.doAppendEntries(args, reply)
 			}else{
-				rf.followerUpdateCommitIndex(args)
+				if rf.Logs[len(rf.Logs)-1].Index <= args.PrevLogIndex{
+					reply.Success = false
+				}else {
+					rf.followerUpdateCommitIndex(args)
+				}
 			}
 			//log.Printf("Peer %d receive heartbeat from Peer %d", rf.me, args.LeaderID)
 		}else{
@@ -559,7 +567,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 }
 
 
-func (rf *Raft)  applyMessage2Tester(logEntry LogEntry){
+func (rf *Raft) applyMessage2Tester(logEntry LogEntry){
 	msg := ApplyMsg{}
 	msg.CommandIndex = logEntry.Index
 	msg.Command = logEntry.Info
@@ -601,7 +609,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		newLogEntry := LogEntry{term, index, command}
 		rf.Logs = append(rf.Logs, newLogEntry)
 		rf.persist()
-		for !rf.distributeAppendEntries(false) {
+		for rf.distributeAppendEntries(false) != 1{
 			if rf.killed(){
 				break
 			}
@@ -680,10 +688,12 @@ func (rf *Raft) leaderUpdateCommitIndex(){
 }
 
 /* return whether the appendEntries for all servers succeed, if not return false,
-and inform the leader to distribute again. If it is a heartbeat, then always return true.
-*/
-func (rf *Raft) distributeAppendEntries(heartbeat bool) bool {
+ *and inform the leader to distribute again. If it is a heartbeat, then always return true.
+ * Return 0 means retry, return 1 means ok, and 2 means turn heartbeat to append entries
+ */
+func (rf *Raft) distributeAppendEntries(heartbeat bool) int {
 	responseChan := make(chan AppendEntriesCallResponse, len(rf.peers))
+	ret := 1
 	if heartbeat{
 		rf.mu.Lock()
 	}
@@ -701,13 +711,21 @@ func (rf *Raft) distributeAppendEntries(heartbeat bool) bool {
 			nil,
 			rf.committedIndex}
 		appendEntriesReply := AppendEntriesReply{}
+		if rf.nextIndex[i] <= rf.Logs[len(rf.Logs)-1].Index{
+			if rf.nextIndex[i] > 0{
+				args.PrevLogIndex = rf.Logs[rf.nextIndex[i]-1].Index
+				args.PrevLogTerm = rf.Logs[rf.nextIndex[i]-1].Term
+			}else{
+				rf.nextIndex[i] = 1
+				args.PrevLogIndex = 0
+				args.PrevLogTerm = rf.Logs[0].Term
+			}
+		}
 		if heartbeat{
 			args.Entries = nil
 		}else{
 			if rf.nextIndex[i] <= rf.Logs[len(rf.Logs)-1].Index{
 				args.Entries = rf.Logs[rf.nextIndex[i]: len(rf.Logs)]
-				args.PrevLogIndex = rf.Logs[rf.nextIndex[i]-1].Index
-				args.PrevLogTerm = rf.Logs[rf.nextIndex[i]-1].Term
 			}else{
 				/* If enter this branch means there are some servers but not this one
 				reject the leader or lost connection with the leader, then here
@@ -732,7 +750,6 @@ func (rf *Raft) distributeAppendEntries(heartbeat bool) bool {
 	notALeader := false
 	/* If normal append entries rpc didn't reach one of the servers, the
 	leader will retry to send the append entries rpc until all */
-	tryAgain := false
 	for round:=1; round < len(rf.peers) && !notALeader; round++{
 		var val AppendEntriesCallResponse
 		select {
@@ -749,8 +766,9 @@ func (rf *Raft) distributeAppendEntries(heartbeat bool) bool {
 						the only reason why the follower reject the appendEntriesRPC
 						is that the term of prevLogIndex in the follower doesn't match
 						prevLogTerm */
+						ret = 2
 						//log.Printf("Peer%d rejet heartbeat from leader%d", val.ID,
-							//rf.me)
+						//	rf.me)
 					}else if val.Success < 0{
 						//log.Printf( "Leader%d think peer%d lost connection", rf.me,
 							//val.ID)
@@ -769,7 +787,7 @@ func (rf *Raft) distributeAppendEntries(heartbeat bool) bool {
 						rf.nextIndex[val.ID] -= 1
 						replicationDebug(fmt.Sprintf("Peer%d failed to get new log entry, decrease nextIndex to% d",
 							val.ID, rf.nextIndex[val.ID]))
-						tryAgain = true
+						ret = 0
 					}else if val.Success == 0{
 						rf.nextIndex[val.ID] = rf.Logs[len(rf.Logs)-1].Index + 1
 						rf.matchIndex[val.ID] = rf.nextIndex[val.ID] - 1
@@ -777,7 +795,7 @@ func (rf *Raft) distributeAppendEntries(heartbeat bool) bool {
 						/* lost connection with val.ID or server didn't reply in time */
 						//log.Printf( "Leader%d think peer%d lost connection", rf.me,
 							//val.ID)
-						tryAgain = true
+						ret = 0
 					}
 				}
 				break
@@ -792,11 +810,11 @@ func (rf *Raft) distributeAppendEntries(heartbeat bool) bool {
 	if heartbeat{
 		rf.mu.Unlock()
 	}
-	if tryAgain && !heartbeat{
+	if ret == 0 && !heartbeat{
 		//log.Printf("Failed to distributed log entires, try again!")
-		return false
+		return ret
 	}
-	return true
+	return ret
 	//// log.Printf("Peer %d finish a round of send heartbeat", rf.me)
 }
 
@@ -923,7 +941,15 @@ func (rf *Raft) ticker() {
 			if rf.killed(){
 				return
 			}
-			rf.distributeAppendEntries( true)
+			ret := rf.distributeAppendEntries( true)
+			if ret == 2{
+				for ret == 2{
+					rf.mu.Lock()
+					ret = rf.distributeAppendEntries(false)
+					rf.mu.Unlock()
+					time.Sleep(time.Millisecond * 10)
+				}
+			}
 			time.Sleep(time.Millisecond * time.Duration(int(heartbeatCircle)/len(rf.peers)))
 		}else if rf.role == FOLLOWER{
 			curSecond := time.Now().UnixNano()
