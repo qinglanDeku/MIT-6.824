@@ -39,12 +39,13 @@ import (
 // Some global values
 // Heartbeat period of leader to send, ms.
 var heartbeatCircle int64 = 100
+var electionTimeoutGap = 150
 // Election timeout, ms.
 var electionTimeoutLower = 200
 var defaultLogCapacity = 1000
 
 // debug triggers
-var electionDebugEnable = false
+var electionDebugEnable = true
 var replicationDebugEnable = false
 
 func electionDebug(s string){
@@ -862,11 +863,12 @@ func (rf *Raft) startElection(){
 			if !sender.sendRequestVote(voterId, args, reply){
 				// do not reply means do not vote
 				voteCh <- -1
-			}
-			if requestReply.VoteGranted{
-				voteCh <- -2
 			}else{
-				voteCh <- requestReply.Term
+				if requestReply.VoteGranted{
+					voteCh <- -2
+				}else{
+					voteCh <- requestReply.Term
+				}
 			}
 		}(i, voteChan, rf, &requestArg, &requestReply)
 	}
@@ -922,14 +924,12 @@ func (rf *Raft) startElection(){
 		/* Send heartbeat twice since we need to wait the timeout of election */
 
 		rf.distributeAppendEntries( true)
-		rf.distributeAppendEntries( true)
 		//log.Printf("Peer %d is leader and finish first round of heartbeat!",
 			//rf.me)
 	}else{
 		electionDebug(fmt.Sprintf("Peer %d received %d votes and failed!", rf.me, votes))
 		rf.role = FOLLOWER
 		rf.mu.Unlock()
-		time.Sleep(time.Millisecond * 20)
 	}
 }
 
@@ -965,19 +965,20 @@ func (rf *Raft) ticker() {
 		}else if rf.role == FOLLOWER{
 			curSecond := time.Now().UnixNano()
 			difference := curSecond - rf.lastHeartbeatUnixTime
-			if difference/(1000*1000) >= heartbeatCircle{
+			electionTimeout := electionTimeoutLower + rand.Intn(electionTimeoutGap)
+			if difference/(1000*1000) >= int64(electionTimeout){
 				//log.Printf("The time difference for  peer %d is %d", rf.me, difference)
 				// Didn't hear from the leader for a 'long time', begin to start a new election
 				rf.VotedFor = -1
 				rf.persist()
 				rf.mu.Unlock()
 				electionDebug(fmt.Sprintf("Peer %d ready for election.\n", rf.me))
-				time.Sleep(time.Millisecond * time.Duration(rand.Intn(int(heartbeatCircle+1))+electionTimeoutLower))
+				time.Sleep(time.Millisecond * time.Duration(electionTimeout))
 				rf.mu.Lock()
 				if rf.killed() || rf.lastHeartbeatUnixTime >= curSecond || rf.VotedFor != -1{
 					electionDebug(fmt.Sprintf("Peer %d give up election.\n", rf.me))
 					rf.mu.Unlock()
-					time.Sleep(time.Millisecond * time.Duration(rand.Intn(int(heartbeatCircle))))
+					time.Sleep(time.Millisecond * time.Duration(electionTimeout))
 					continue
 				}
 				rf.mu.Unlock()
@@ -985,9 +986,16 @@ func (rf *Raft) ticker() {
 				if rf.killed(){
 					break
 				}
+				rf.mu.Lock()
+				if rf.role != LEADER{
+					rf.mu.Unlock()
+					time.Sleep(time.Millisecond * time.Duration(electionTimeout))
+				}else{
+					rf.mu.Unlock()
+				}
 			}else{
 				rf.mu.Unlock()
-				time.Sleep(time.Millisecond * time.Duration(int(heartbeatCircle)))
+				time.Sleep(time.Millisecond * time.Duration(electionTimeout))
 				//time.Sleep(time.Millisecond * time.Duration(rand.Intn(int(heartbeatCircle)) + 1))
 			}
 
