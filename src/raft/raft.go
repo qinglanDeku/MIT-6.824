@@ -39,13 +39,13 @@ import (
 // Some global values
 // Heartbeat period of leader to send, ms.
 var heartbeatCircle int64 = 100
-var electionTimeoutGap = 150
+var electionTimeoutGap = 100
 // Election timeout, ms.
-var electionTimeoutLower = 200
+var electionTimeoutLower = 175
 var defaultLogCapacity = 1000
 
 // debug triggers
-var electionDebugEnable = true
+var electionDebugEnable = false
 var replicationDebugEnable = false
 
 func electionDebug(s string){
@@ -330,7 +330,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				rf.lastHeartbeatUnixTime = time.Now().UnixNano()
 				reply.Term = args.Term
 				reply.VoteGranted = true
-				electionDebug(fmt.Sprintf("Peer %d voted for Peer %d", rf.me, args.CandidateID))
+				electionDebug(fmt.Sprintf("Peer %d voted for Peer %d::%v, %v, %v, 1. Logs: %v", rf.me, args.CandidateID,
+					len(rf.Logs) == 1, args.LastLogTerm > rf.Logs[len(rf.Logs)-1].Term,
+					args.LastLogTerm == rf.Logs[len(rf.Logs)-1].Term && args.LastLogIndex >= rf.Logs[len(rf.Logs)-1].Index,
+					rf.Logs))
+			}else{
+				reply.Term = args.Term
+				reply.VoteGranted = false
 			}
 
 		}
@@ -342,9 +348,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.CurrentTerm = args.Term
 			rf.persist()
 			rf.lastHeartbeatUnixTime = time.Now().UnixNano()
-			electionDebug(fmt.Sprintf("Peer %d voted for Peer %d", rf.me, args.CandidateID))
+			electionDebug(fmt.Sprintf("Peer %d voted for Peer %d::%v, %v, %v, 2. Logs: %v", rf.me, args.CandidateID,
+				len(rf.Logs) == 1, args.LastLogTerm > rf.Logs[len(rf.Logs)-1].Term,
+				args.LastLogTerm == rf.Logs[len(rf.Logs)-1].Term && args.LastLogIndex >= rf.Logs[len(rf.Logs)-1].Index,
+				rf.Logs))
 			reply.Term = args.Term
 			reply.VoteGranted = true
+		}else{
+			reply.Term = args.Term
+			reply.VoteGranted = false
 		}
 	}
 	rf.mu.Unlock()
@@ -796,7 +808,17 @@ func (rf *Raft) distributeAppendEntries(heartbeat bool) int {
 						the only reason why the follower reject the appendEntriesRPC
 						is that the term of prevLogIndex in the follower doesn't match
 						prevLogTerm */
-						rf.nextIndex[val.ID] -= 1
+						delta := rf.Logs[len(rf.Logs)-1].Index - rf.nextIndex[val.ID]
+						if delta < 5 {
+							rf.nextIndex[val.ID] -= 1
+						}else if delta >= 5 && delta <=20{
+							rf.nextIndex[val.ID] -= 5
+						}else{
+							rf.nextIndex[val.ID] -= delta
+						}
+						if rf.nextIndex[val.ID] <= 0{
+							rf.nextIndex[val.ID] = 1
+						}
 						replicationDebug(fmt.Sprintf("Peer%d failed to get new log entry, decrease nextIndex to% d",
 							val.ID, rf.nextIndex[val.ID]))
 						ret = 0
@@ -877,7 +899,7 @@ func (rf *Raft) startElection(){
 	beChosen 	:= 0
 	counter 	:= 1
 	votes		:= 1	// one votes for itself
-	for round:=0; round < len(rf.peers) &&  counter < len(rf.peers); round++ {
+	for round:=1; round < len(rf.peers); round++ {
 		// log.Printf("Peer %d wait for votes result", rf.me)
 		val := 0
 		select{
@@ -899,7 +921,7 @@ func (rf *Raft) startElection(){
 			}
 			counter += 1
 			break
-		case <-time.After(time.Millisecond*time.Duration(heartbeatCircle/int64(len(rf.peers)))):
+		case <-time.After(time.Millisecond* 20):
 			counter += 1
 			break
 		}
@@ -915,9 +937,9 @@ func (rf *Raft) startElection(){
 		/* Before send heartbeat, set all properties of the leader correctly */
 		rf.turnToLeader()
 		/* Here the appendEntriesArgs are set for heartbeat */
+		electionDebug(fmt.Sprintf("Peer %d become leader, received %d votes, the term is %d. Logs is  %v", rf.me, beChosen,
+			rf.CurrentTerm, rf.Logs))
 		rf.mu.Unlock()
-		electionDebug(fmt.Sprintf("Peer %d become leader, received %d votes, the term is %d", rf.me, beChosen,
-			rf.CurrentTerm))
 		if rf.killed(){
 			return
 		}
@@ -988,6 +1010,8 @@ func (rf *Raft) ticker() {
 				}
 				rf.mu.Lock()
 				if rf.role != LEADER{
+					rf.VotedFor = -1
+					rf.persist()
 					rf.mu.Unlock()
 					time.Sleep(time.Millisecond * time.Duration(electionTimeout))
 				}else{
