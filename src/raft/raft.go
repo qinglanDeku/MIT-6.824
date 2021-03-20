@@ -45,7 +45,7 @@ var electionTimeoutLower = 175
 var defaultLogCapacity = 1000
 
 // debug triggers
-var electionDebugEnable = false
+var electionDebugEnable = true
 var replicationDebugEnable = false
 
 func electionDebug(s string){
@@ -313,49 +313,73 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 	rf.mu.Lock()
+	//if args.Term < rf.CurrentTerm {
+	//	reply.Term = rf.CurrentTerm
+	//	reply.VoteGranted = false
+	//}else if args.Term == rf.CurrentTerm {
+	//	if rf.VotedFor != -1{
+	//		reply.Term = rf.CurrentTerm
+	//		reply.VoteGranted = false
+	//	}else{
+	//		if len(rf.Logs) == 1 || args.LastLogTerm > rf.Logs[len(rf.Logs)-1].Term ||
+	//			(args.LastLogTerm == rf.Logs[len(rf.Logs)-1].Term && args.LastLogIndex >= rf.Logs[len(rf.Logs)-1].Index){
+	//			rf.role = FOLLOWER
+	//			rf.VotedFor = args.CandidateID
+	//			rf.CurrentTerm = args.Term
+	//			rf.persist()
+	//			rf.lastHeartbeatUnixTime = time.Now().UnixNano()
+	//			reply.Term = args.Term
+	//			reply.VoteGranted = true
+	//			electionDebug(fmt.Sprintf("Peer %d voted for Peer %d::%v, %v, %v, 1. Logs: %v", rf.me, args.CandidateID,
+	//				len(rf.Logs) == 1, args.LastLogTerm > rf.Logs[len(rf.Logs)-1].Term,
+	//				args.LastLogTerm == rf.Logs[len(rf.Logs)-1].Term && args.LastLogIndex >= rf.Logs[len(rf.Logs)-1].Index,
+	//				rf.Logs))
+	//		}else{
+	//			reply.Term = args.Term
+	//			reply.VoteGranted = false
+	//		}
+	//
+	//	}
+	//}else{
+	//	if len(rf.Logs) == 1 || args.LastLogTerm > rf.Logs[len(rf.Logs)-1].Term ||
+	//		(args.LastLogTerm == rf.Logs[len(rf.Logs)-1].Term && args.LastLogIndex >= rf.Logs[len(rf.Logs)-1].Index) {
+	//		rf.role = FOLLOWER
+	//		rf.VotedFor = args.CandidateID
+	//		rf.CurrentTerm = args.Term
+	//		rf.persist()
+	//		rf.lastHeartbeatUnixTime = time.Now().UnixNano()
+	//		electionDebug(fmt.Sprintf("Peer %d voted for Peer %d::%v, %v, %v, 2. Logs: %v", rf.me, args.CandidateID,
+	//			len(rf.Logs) == 1, args.LastLogTerm > rf.Logs[len(rf.Logs)-1].Term,
+	//			args.LastLogTerm == rf.Logs[len(rf.Logs)-1].Term && args.LastLogIndex >= rf.Logs[len(rf.Logs)-1].Index,
+	//			rf.Logs))
+	//		reply.Term = args.Term
+	//		reply.VoteGranted = true
+	//	}else{
+	//		reply.Term = args.Term
+	//		reply.VoteGranted = false
+	//	}
+	//}
 	if args.Term < rf.CurrentTerm {
 		reply.Term = rf.CurrentTerm
 		reply.VoteGranted = false
-	}else if args.Term == rf.CurrentTerm {
-		if rf.VotedFor != -1{
-			reply.Term = rf.CurrentTerm
-			reply.VoteGranted = false
-		}else{
+	}else{
+		if rf.VotedFor == -1 || rf.VotedFor == args.CandidateID{
 			if len(rf.Logs) == 1 || args.LastLogTerm > rf.Logs[len(rf.Logs)-1].Term ||
-				(args.LastLogTerm == rf.Logs[len(rf.Logs)-1].Term && args.LastLogIndex >= rf.Logs[len(rf.Logs)-1].Index){
+				(args.LastLogTerm == rf.Logs[len(rf.Logs)-1].Term && args.LastLogIndex >= rf.Logs[len(rf.Logs)-1].Index) {
 				rf.role = FOLLOWER
 				rf.VotedFor = args.CandidateID
 				rf.CurrentTerm = args.Term
 				rf.persist()
 				rf.lastHeartbeatUnixTime = time.Now().UnixNano()
-				reply.Term = args.Term
-				reply.VoteGranted = true
-				electionDebug(fmt.Sprintf("Peer %d voted for Peer %d::%v, %v, %v, 1. Logs: %v", rf.me, args.CandidateID,
+				electionDebug(fmt.Sprintf("Peer %d voted for Peer %d::%v, %v, %v, 2. Logs: %v", rf.me, args.CandidateID,
 					len(rf.Logs) == 1, args.LastLogTerm > rf.Logs[len(rf.Logs)-1].Term,
 					args.LastLogTerm == rf.Logs[len(rf.Logs)-1].Term && args.LastLogIndex >= rf.Logs[len(rf.Logs)-1].Index,
 					rf.Logs))
-			}else{
 				reply.Term = args.Term
-				reply.VoteGranted = false
+				reply.VoteGranted = true
 			}
-
-		}
-	}else{
-		if len(rf.Logs) == 1 || args.LastLogTerm > rf.Logs[len(rf.Logs)-1].Term ||
-			(args.LastLogTerm == rf.Logs[len(rf.Logs)-1].Term && args.LastLogIndex >= rf.Logs[len(rf.Logs)-1].Index) {
-			rf.role = FOLLOWER
-			rf.VotedFor = args.CandidateID
-			rf.CurrentTerm = args.Term
-			rf.persist()
-			rf.lastHeartbeatUnixTime = time.Now().UnixNano()
-			electionDebug(fmt.Sprintf("Peer %d voted for Peer %d::%v, %v, %v, 2. Logs: %v", rf.me, args.CandidateID,
-				len(rf.Logs) == 1, args.LastLogTerm > rf.Logs[len(rf.Logs)-1].Term,
-				args.LastLogTerm == rf.Logs[len(rf.Logs)-1].Term && args.LastLogIndex >= rf.Logs[len(rf.Logs)-1].Index,
-				rf.Logs))
-			reply.Term = args.Term
-			reply.VoteGranted = true
 		}else{
-			reply.Term = args.Term
+			reply.Term = rf.CurrentTerm
 			reply.VoteGranted = false
 		}
 	}
@@ -418,7 +442,12 @@ func (rf*Raft) followerUpdateCommitIndex(args *AppendEntriesArgs){
 	if args.LeaderCommit > rf.committedIndex{
 		newCommitted := int(math.Min(float64(args.LeaderCommit), float64(rf.Logs[len(rf.Logs)-1].Index)))
 		/* Apply log changes to tester too */
-		newLogs := rf.Logs[rf.committedIndex+1:newCommitted+1]
+		var newLogs []LogEntry
+		if rf.committedIndex < newCommitted{
+			newLogs = rf.Logs[rf.committedIndex+1:newCommitted+1]
+		}else{
+			newLogs = rf.Logs[0: newCommitted + 1]
+		}
 		doChangeCommitted := false
 		for _, e := range newLogs{
 			/* 	Test2BReJoin: HeartBeat before really distributed some entries may pass a false
@@ -466,60 +495,75 @@ func (rf*Raft) doAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRepl
 			reply.Success = false
 		}
 	}else{
-		if rf.Logs[len(rf.Logs)-1].Term == args.PrevLogTerm &&
-			rf.Logs[len(rf.Logs)-1].Index < args.PrevLogIndex{
-			/* If the server's log is behind the leaders in index, we need to find
-			the match point and add all entries after that point step
-			by step by using appendEntriesRPC and nextIndex[] go back */
+		//if rf.Logs[len(rf.Logs)-1].Term == args.PrevLogTerm &&
+		//	rf.Logs[len(rf.Logs)-1].Index < args.PrevLogIndex{
+		//	/* If the server's log is behind the leaders in index, we need to find
+		//	the match point and add all entries after that point step
+		//	by step by using appendEntriesRPC and nextIndex[] go back */
+		//	reply.Success = false
+		//}else if rf.Logs[len(rf.Logs)-1].Term == args.PrevLogTerm &&
+		//	rf.Logs[len(rf.Logs)-1].Index == args.PrevLogIndex{
+		//	/* Here we can apply new entries to the server. */
+		//	reply.Success = true
+		//	rf.Logs = append(rf.Logs, args.Entries...)
+		//	rf.persist()
+		//	rf.followerUpdateCommitIndex(args)
+		//}else if rf.Logs[len(rf.Logs)-1].Term == args.PrevLogTerm &&
+		//	rf.Logs[len(rf.Logs)-1].Index > args.PrevLogIndex{
+		//	/* If the server's log exceed the leaders(unlikely), remove all extra log
+		//	entries.*/
+		//	beginReplicatedLoc := -1
+		//	for i := len(rf.Logs)-2; i > 0; i--{
+		//		if rf.Logs[i].Index == args.PrevLogIndex && rf.Logs[i].Term == args.PrevLogTerm{
+		//			beginReplicatedLoc = i
+		//			break
+		//		}
+		//	}
+		//	if beginReplicatedLoc != -1{
+		//		rf.Logs = append(rf.Logs[0: beginReplicatedLoc+1], args.Entries...)
+		//		rf.persist()
+		//		reply.Success = true
+		//		rf.followerUpdateCommitIndex(args)
+		//	}else{
+		//		reply.Success = false
+		//	}
+		//}else if rf.Logs[len(rf.Logs)-1].Term != args.PrevLogTerm{
+		//	/* If the server's log is behind the leaders in term, we need to find
+		//	the match point and add all entries after that point step
+		//	by step by using appendEntriesRPC and nextIndex[] go back. */
+		//	if args.PrevLogTerm == -1{
+		//		/* This means that the follower should apply all new entries to
+		//		its Logs. */
+		//		rf.Logs = append(rf.Logs[0:1], args.Entries...)
+		//		rf.persist()
+		//		reply.Success = true
+		//		rf.followerUpdateCommitIndex(args)
+		//	}else{
+		//		reply.Success = false
+		//	}
+		//	/* TODO: However, it is possible that the server has no common log
+		//	entries with leader(though it is very unlikely.) In this situation, need to
+		//	set a special method to copy whole log to the server */
+		//}else{
+		//	/* Should not enter here !!!*/
+		//	log.Printf("Enter the wrong branch when append entries!")
+		//	reply.Success = false
+		//}
+		if args.PrevLogIndex >= len(rf.Logs) || rf.Logs[args.PrevLogIndex].Term != args.PrevLogTerm{
 			reply.Success = false
-		}else if rf.Logs[len(rf.Logs)-1].Term == args.PrevLogTerm &&
-			rf.Logs[len(rf.Logs)-1].Index == args.PrevLogIndex{
-			/* Here we can apply new entries to the server. */
+			reply.Term = rf.CurrentTerm
+			if args.PrevLogIndex < len(rf.Logs){
+				rf.Logs = rf.Logs[0: args.PrevLogIndex]
+				rf.persist()
+			}
+		}else{
 			reply.Success = true
-			rf.Logs = append(rf.Logs, args.Entries...)
+			reply.Term = rf.CurrentTerm
+			rf.Logs = append(rf.Logs[0: args.PrevLogIndex+1],  args.Entries...)
 			rf.persist()
 			rf.followerUpdateCommitIndex(args)
-		}else if rf.Logs[len(rf.Logs)-1].Term == args.PrevLogTerm &&
-			rf.Logs[len(rf.Logs)-1].Index > args.PrevLogIndex{
-			/* If the server's log exceed the leaders(unlikely), remove all extra log
-			entries.*/
-			beginReplicatedLoc := -1
-			for i := len(rf.Logs)-2; i > 0; i--{
-				if rf.Logs[i].Index == args.PrevLogIndex && rf.Logs[i].Term == args.PrevLogTerm{
-					beginReplicatedLoc = i
-					break
-				}
-			}
-			if beginReplicatedLoc != -1{
-				rf.Logs = append(rf.Logs[0: beginReplicatedLoc+1], args.Entries...)
-				rf.persist()
-				reply.Success = true
-				rf.followerUpdateCommitIndex(args)
-			}else{
-				reply.Success = false
-			}
-		}else if rf.Logs[len(rf.Logs)-1].Term != args.PrevLogTerm{
-			/* If the server's log is behind the leaders in term, we need to find
-			the match point and add all entries after that point step
-			by step by using appendEntriesRPC and nextIndex[] go back. */
-			if args.PrevLogTerm == -1{
-				/* This means that the follower should apply all new entries to
-				its Logs. */
-				rf.Logs = append(rf.Logs[0:1], args.Entries...)
-				rf.persist()
-				reply.Success = true
-				rf.followerUpdateCommitIndex(args)
-			}else{
-				reply.Success = false
-			}
-			/* TODO: However, it is possible that the server has no common log
-			entries with leader(though it is very unlikely.) In this situation, need to
-			set a special method to copy whole log to the server */
-		}else{
-			/* Should not enter here !!!*/
-			log.Printf("Enter the wrong branch when append entries!")
-			reply.Success = false
 		}
+
 	}
 	//log.Printf("After append entries, the logs of peer %d is %d",
 		//rf.me, rf.logs)
@@ -628,6 +672,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		index = rf.Logs[len(rf.Logs)-1].Index + 1
 	}
 	term = rf.CurrentTerm
+	if rf.killed(){
+		rf.mu.Unlock()
+		return index, term, isLeader
+	}
 	if isLeader{
 		// Index start from 1
 		newLogEntry := LogEntry{term, index, command}
@@ -844,12 +892,7 @@ func (rf *Raft) distributeAppendEntries(heartbeat bool) int {
 	if heartbeat{
 		rf.mu.Unlock()
 	}
-	if ret == 0 && !heartbeat{
-		//log.Printf("Failed to distributed log entires, try again!")
-		return ret
-	}
 	return ret
-	//// log.Printf("Peer %d finish a round of send heartbeat", rf.me)
 }
 
 func (rf *Raft) startElection(){
