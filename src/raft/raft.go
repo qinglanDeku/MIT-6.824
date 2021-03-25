@@ -681,17 +681,18 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		newLogEntry := LogEntry{term, index, command}
 		rf.Logs = append(rf.Logs, newLogEntry)
 		rf.persist()
-		for rf.distributeAppendEntries(false) != 1{
-			if rf.killed(){
-				break
-			}
-			time.Sleep(time.Millisecond * 10)
-		}
+		rf.distributeAppendEntries(false)
+		//for rf.distributeAppendEntries(false) != 1{
+		//	if rf.killed(){
+		//		break
+		//	}
+		//	time.Sleep(time.Millisecond * 10)
+		//}
 		rf.mu.Unlock()
-		replicationDebug(fmt.Sprintf("Leader%d return index:%d, term:%d", rf.me, index, term))
+		//replicationDebug(fmt.Sprintf("Leader%d return index:%d, term:%d", rf.me, index, term))
 	}else{
 		rf.mu.Unlock()
-		replicationDebug(fmt.Sprintf("Peer%d return index:%d, term:%d", rf.me, index, term))
+		//replicationDebug(fmt.Sprintf("Peer%d return index:%d, term:%d", rf.me, index, term))
 	}
 
 	return index, term, isLeader
@@ -766,9 +767,6 @@ func (rf *Raft) leaderUpdateCommitIndex(){
 func (rf *Raft) distributeAppendEntries(heartbeat bool) int {
 	responseChan := make(chan AppendEntriesCallResponse, len(rf.peers))
 	ret := 1
-	if heartbeat{
-		rf.mu.Lock()
-	}
 	for i := 0; i < len(rf.peers)&&!rf.killed(); i++{
 		if i == rf.me{
 			continue
@@ -793,18 +791,14 @@ func (rf *Raft) distributeAppendEntries(heartbeat bool) int {
 				args.PrevLogTerm = rf.Logs[0].Term
 			}
 		}
-		if heartbeat{
-			args.Entries = nil
+		if rf.nextIndex[i] <= rf.Logs[len(rf.Logs)-1].Index{
+			args.Entries = rf.Logs[rf.nextIndex[i]: len(rf.Logs)]
 		}else{
-			if rf.nextIndex[i] <= rf.Logs[len(rf.Logs)-1].Index{
-				args.Entries = rf.Logs[rf.nextIndex[i]: len(rf.Logs)]
-			}else{
-				/* If enter this branch means there are some servers but not this one
-				reject the leader or lost connection with the leader, then here
-				send a heartbeat to this server is enough since it doesn't need to apply
-				new logs */
-				args.Entries = nil
-			}
+			/* If enter this branch means there are some servers but not this one
+			reject the leader or lost connection with the leader, then here
+			send a heartbeat to this server is enough since it doesn't need to apply
+			new logs */
+			args.Entries = nil
 		}
 		go func(reChan chan AppendEntriesCallResponse, followerId int, sender *Raft, appendArg *AppendEntriesArgs,
 			reply *AppendEntriesReply){
@@ -819,77 +813,55 @@ func (rf *Raft) distributeAppendEntries(heartbeat bool) int {
 			}
 		}(responseChan, i, rf, &args, &appendEntriesReply)
 	}
-	notALeader := false
 	/* If normal append entries rpc didn't reach one of the servers, the
 	leader will retry to send the append entries rpc until all */
-	for round:=1; round < len(rf.peers) && !notALeader; round++{
+	for round:=1; round < len(rf.peers); round++{
 		var val AppendEntriesCallResponse
 		select {
 			case val = <-responseChan:
-				if heartbeat{
-					if val.Success > 0 && rf.CurrentTerm < val.Success{
-						rf.CurrentTerm = val.Success
-						rf.persist()
-						rf.role = FOLLOWER
-						notALeader = true
-					}else if val.Success > 0 && rf.CurrentTerm == val.Success{
-						/* If terms of leader and the follower are the same, then
-						the only reason why the follower reject the appendEntriesRPC
-						is that the term of prevLogIndex in the follower doesn't match
-						prevLogTerm */
-						ret = 2
-						//log.Printf("Peer%d reject heartbeat from leader%d", val.ID,
-						//	rf.me)
-					}else if val.Success < 0{
-						//log.Printf( "Leader%d think peer%d lost connection", rf.me,
-							//val.ID)
-					}
-				}else{
-					if val.Success > 0 && rf.CurrentTerm < val.Success{
-						rf.CurrentTerm = val.Success
-						rf.persist()
-						rf.role = FOLLOWER
-						notALeader = true
-					}else if val.Success > 0 && rf.CurrentTerm == val.Success{
-						/* If terms of leader and the follower are the same, then
-						the only reason why the follower reject the appendEntriesRPC
-						is that the term of prevLogIndex in the follower doesn't match
-						prevLogTerm */
-						delta := rf.Logs[len(rf.Logs)-1].Index - rf.nextIndex[val.ID]
-						if delta < 5 {
-							rf.nextIndex[val.ID] -= 1
-						}else if delta >= 5 && delta <=20{
-							rf.nextIndex[val.ID] -= 5
-						}else{
-							rf.nextIndex[val.ID] -= delta
-						}
-						if rf.nextIndex[val.ID] <= 0{
-							rf.nextIndex[val.ID] = 1
-						}
-						replicationDebug(fmt.Sprintf("Peer%d failed to get new log entry, decrease nextIndex to% d",
-							val.ID, rf.nextIndex[val.ID]))
-						ret = 0
-					}else if val.Success == 0{
-						rf.nextIndex[val.ID] = rf.Logs[len(rf.Logs)-1].Index + 1
-						rf.matchIndex[val.ID] = rf.nextIndex[val.ID] - 1
+				if val.Success > 0 && rf.CurrentTerm < val.Success{
+					rf.CurrentTerm = val.Success
+					rf.persist()
+					rf.role = FOLLOWER
+					return ret
+				}else if val.Success > 0 && rf.CurrentTerm == val.Success{
+					/* If terms of leader and the follower are the same, then
+					the only reason why the follower reject the appendEntriesRPC
+					is that the term of prevLogIndex in the follower doesn't match
+					prevLogTerm */
+					delta := rf.Logs[len(rf.Logs)-1].Index - rf.nextIndex[val.ID]
+					if delta < 2 {
+						rf.nextIndex[val.ID] -= 1
+					}else if delta >= 2 && delta <=10{
+						rf.nextIndex[val.ID] -= 5
 					}else{
-						/* lost connection with val.ID or server didn't reply in time */
-						//log.Printf( "Leader%d think peer%d lost connection", rf.me,
-							//val.ID)
-						ret = 0
+						rf.nextIndex[val.ID] -= delta
 					}
+					if rf.nextIndex[val.ID] <= 0{
+						rf.nextIndex[val.ID] = 1
+					}
+					replicationDebug(fmt.Sprintf("Peer%d failed to get new log entry, decrease nextIndex to% d",
+						val.ID, rf.nextIndex[val.ID]))
+					ret = 0
+				}else if val.Success == 0{
+					rf.nextIndex[val.ID] = rf.Logs[len(rf.Logs)-1].Index + 1
+					rf.matchIndex[val.ID] = rf.nextIndex[val.ID] - 1
+				}else{
+					/* lost connection with val.ID or server didn't reply in time */
+					//log.Printf( "Leader%d think peer%d lost connection", rf.me,
+						//val.ID)
+					ret = 0
 				}
 				break
-			case <-time.After(time.Millisecond*20):
+			case <-time.After(time.Millisecond*time.Duration(int(heartbeatCircle)/len(rf.peers))):
 				/* lost connection with val.ID or server didn't reply in time */
 				/* TODO: Under this situation, does the leader need to retry send
 				AppendEntriesRPC */
 				break
 		}
 	}
-	rf.leaderUpdateCommitIndex()
-	if heartbeat{
-		rf.mu.Unlock()
+	if ret == 1 {
+		rf.leaderUpdateCommitIndex()
 	}
 	return ret
 }
@@ -924,11 +896,14 @@ func (rf *Raft) startElection(timeout int){
 		//log.Printf("Peer %d request vote from peer %d", rf.me, i)
 		// First vote for self, 1 means votes
 		go func(voterId int, voteCh chan int, sender *Raft, args *RequestVoteArgs, reply *RequestVoteReply){
-			sender.sendRequestVote(voterId, args, reply)
-			if requestReply.VoteGranted{
-				voteCh <- -2
+			if !sender.sendRequestVote(voterId, args, reply){
+				voteCh <- -1
 			}else{
-				voteCh <- requestReply.Term
+				if requestReply.VoteGranted{
+					voteCh <- -2
+				}else{
+					voteCh <- requestReply.Term
+				}
 			}
 		}(i, voteChan, rf, &requestArg, &requestReply)
 	}
@@ -949,6 +924,7 @@ func (rf *Raft) startElection(timeout int){
 					votes += 1
 				}else if val == -1{
 					// has no reply from voter
+					counter += 1
 				}else{
 					rf.mu.Lock()
 					if val > rf.CurrentTerm {
@@ -962,9 +938,9 @@ func (rf *Raft) startElection(timeout int){
 				}
 				counter += 1
 				break
-			case <-time.After(time.Millisecond* 20):
-				counter += 1
-				break
+			//case <-time.After(time.Millisecond* 20):
+			//	counter += 1
+			//	break
 			case <-timer.C:
 				runOutOfTime = true
 				break
@@ -989,13 +965,14 @@ func (rf *Raft) startElection(timeout int){
 		/* Here the appendEntriesArgs are set for heartbeat */
 		electionDebug(fmt.Sprintf("Peer %d become leader, received %d votes, the term is %d. Logs is  %v", rf.me, beChosen,
 			rf.CurrentTerm, rf.Logs))
-		rf.mu.Unlock()
 		if rf.killed(){
+			rf.mu.Unlock()
 			return
 		}
 		/* Send heartbeat twice since we need to wait the timeout of election */
 
-		rf.distributeAppendEntries( true)
+		rf.distributeAppendEntries( false)
+		rf.mu.Unlock()
 		//log.Printf("Peer %d is leader and finish first round of heartbeat!",
 			//rf.me)
 	}else{
@@ -1020,19 +997,14 @@ func (rf *Raft) ticker() {
 		rf.mu.Lock()
 		if rf.role == LEADER{
 			/* Here send heartbeat, since no entry is appended. */
-			rf.mu.Unlock()
 			if rf.killed(){
 				return
 			}
-			ret := rf.distributeAppendEntries( true)
-			if ret == 2{
-				for ret == 2{
-					rf.mu.Lock()
-					ret = rf.distributeAppendEntries(false)
-					rf.mu.Unlock()
-					time.Sleep(time.Millisecond * 10)
-				}
-			}
+			rf.distributeAppendEntries( false)
+			//for rf.distributeAppendEntries( false) != 1{
+			//	time.Sleep(time.Millisecond * 10)
+			//}
+			rf.mu.Unlock()
 			time.Sleep(time.Millisecond * time.Duration(int(heartbeatCircle)/len(rf.peers)))
 		}else if rf.role == FOLLOWER{
 			curSecond := time.Now().UnixNano()
