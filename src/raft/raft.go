@@ -45,7 +45,7 @@ var electionTimeoutLower = 175
 var defaultLogCapacity = 1000
 
 // debug triggers
-var electionDebugEnable = true
+var electionDebugEnable = false
 var replicationDebugEnable = false
 
 func electionDebug(s string){
@@ -737,7 +737,7 @@ func (rf *Raft) leaderUpdateCommitIndex(){
 		}
 	}
 	for k, v := range commitIndexMap{
-		if v > (len(rf.peers) - 1)/2{
+		if v > (len(rf.peers))/2{
 			if k > rf.committedIndex && rf.Logs[k].Term == rf.CurrentTerm {
 				/* Apply the committed log to tester*/
 				newLogs := rf.Logs[rf.committedIndex+1:k+1]
@@ -827,7 +827,6 @@ func (rf *Raft) distributeAppendEntries(heartbeat bool) int {
 		select {
 			case val = <-responseChan:
 				if heartbeat{
-
 					if val.Success > 0 && rf.CurrentTerm < val.Success{
 						rf.CurrentTerm = val.Success
 						rf.persist()
@@ -839,7 +838,7 @@ func (rf *Raft) distributeAppendEntries(heartbeat bool) int {
 						is that the term of prevLogIndex in the follower doesn't match
 						prevLogTerm */
 						ret = 2
-						//log.Printf("Peer%d rejet heartbeat from leader%d", val.ID,
+						//log.Printf("Peer%d reject heartbeat from leader%d", val.ID,
 						//	rf.me)
 					}else if val.Success < 0{
 						//log.Printf( "Leader%d think peer%d lost connection", rf.me,
@@ -881,7 +880,7 @@ func (rf *Raft) distributeAppendEntries(heartbeat bool) int {
 					}
 				}
 				break
-			case <-time.After(time.Millisecond*time.Duration(heartbeatCircle/int64(len(rf.peers) + 2))):
+			case <-time.After(time.Millisecond*20):
 				/* lost connection with val.ID or server didn't reply in time */
 				/* TODO: Under this situation, does the leader need to retry send
 				AppendEntriesRPC */
@@ -895,7 +894,7 @@ func (rf *Raft) distributeAppendEntries(heartbeat bool) int {
 	return ret
 }
 
-func (rf *Raft) startElection(){
+func (rf *Raft) startElection(timeout int){
 	// Here we should start a new election
 	// Set a random election timeout to avoid split vote.
 	rf.mu.Lock()
@@ -925,15 +924,11 @@ func (rf *Raft) startElection(){
 		//log.Printf("Peer %d request vote from peer %d", rf.me, i)
 		// First vote for self, 1 means votes
 		go func(voterId int, voteCh chan int, sender *Raft, args *RequestVoteArgs, reply *RequestVoteReply){
-			if !sender.sendRequestVote(voterId, args, reply){
-				// do not reply means do not vote
-				voteCh <- -1
+			sender.sendRequestVote(voterId, args, reply)
+			if requestReply.VoteGranted{
+				voteCh <- -2
 			}else{
-				if requestReply.VoteGranted{
-					voteCh <- -2
-				}else{
-					voteCh <- requestReply.Term
-				}
+				voteCh <- requestReply.Term
 			}
 		}(i, voteChan, rf, &requestArg, &requestReply)
 	}
@@ -942,33 +937,45 @@ func (rf *Raft) startElection(){
 	beChosen 	:= 0
 	counter 	:= 1
 	votes		:= 1	// one votes for itself
-	for round:=1; round < len(rf.peers); round++ {
+	runOutOfTime := false
+	timer := time.NewTicker(time.Duration(timeout) * time.Millisecond)
+	defer timer.Stop()
+	for ; counter < len(rf.peers) && !runOutOfTime; {
 		// log.Printf("Peer %d wait for votes result", rf.me)
 		val := 0
 		select{
-		case val = <-voteChan:
-			if val == -2{
-				votes += 1
-			}else if val == -1{
-				// has no reply from voter
-			}else{
-				rf.mu.Lock()
-				if val > rf.CurrentTerm {
-					rf.CurrentTerm = val
-					rf.persist()
-					rf.role = FOLLOWER
+			case val = <-voteChan:
+				if val == -2{
+					votes += 1
+				}else if val == -1{
+					// has no reply from voter
+				}else{
+					rf.mu.Lock()
+					if val > rf.CurrentTerm {
+						rf.CurrentTerm = val
+						rf.persist()
+						rf.role = FOLLOWER
+						rf.mu.Unlock()
+						break
+					}
 					rf.mu.Unlock()
-					break
 				}
-				rf.mu.Unlock()
-			}
-			counter += 1
-			break
-		case <-time.After(time.Millisecond* 20):
-			counter += 1
-			break
+				counter += 1
+				break
+			case <-time.After(time.Millisecond* 20):
+				counter += 1
+				break
+			case <-timer.C:
+				runOutOfTime = true
+				break
 		}
 		//log.Printf("Peer %d receive %d votes", rf.me, votes)
+		rf.mu.Lock()
+		if rf.role == FOLLOWER{
+			rf.mu.Unlock()
+			break
+		}
+		rf.mu.Unlock()
 		if votes > len(rf.peers)/2{
 			beChosen = votes
 			break
@@ -1047,7 +1054,7 @@ func (rf *Raft) ticker() {
 					continue
 				}
 				rf.mu.Unlock()
-				rf.startElection()
+				rf.startElection(electionTimeout)
 				if rf.killed(){
 					break
 				}
