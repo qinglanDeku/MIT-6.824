@@ -114,6 +114,19 @@ func (le *LogEntry) toBytes() []byte{
 	return ret
 }
 
+/* Called when doing snapshot, while turning to bytes, can also apply to tester*/
+func (rf *Raft) logs2Bytes(logs []LogEntry) []byte{
+	var retBytes = make([]byte, 0)
+	for _, entry := range logs{
+		newBytes := entry.toBytes()
+		msg := ApplyMsg{false, -1, -1, true,
+			newBytes, entry.Term, entry.Index}
+		rf.applyChan <- msg
+		retBytes = append(retBytes, newBytes...)
+	}
+	return retBytes
+}
+
 
 //
 // A Go object implementing a single Raft peer.
@@ -189,20 +202,8 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
-//
-// save Raft's persistent state to stable storage,
-// where it can later be retrieved after a crash and restart.
-// see paper's Figure 2 for a description of what should be persistent.
-//
-func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+
+func (rf *Raft) state2Bytes() []byte{
 	w := new(bytes.Buffer)
 	encoder := labgob.NewEncoder(w)
 	err := encoder.Encode(rf.CurrentTerm)
@@ -217,7 +218,23 @@ func (rf *Raft) persist() {
 	if err != nil{
 		log.Printf("Failed to store persist state for peer %d\n", rf.me)
 	}
-	data := w.Bytes()
+	return w.Bytes()
+}
+//
+// save Raft's persistent state to stable storage,
+// where it can later be retrieved after a crash and restart.
+// see paper's Figure 2 for a description of what should be persistent.
+//
+func (rf *Raft) persist() {
+	// Your code here (2C).
+	// Example:
+	// w := new(bytes.Buffer)
+	// e := labgob.NewEncoder(w)
+	// e.Encode(rf.xxx)
+	// e.Encode(rf.yyy)
+	// data := w.Bytes()
+	// rf.persister.SaveRaftState(data)
+	data := rf.state2Bytes()
 	rf.persister.SaveRaftState(data)
 
 }
@@ -262,6 +279,28 @@ func (rf *Raft) readPersist(data []byte) {
 }
 
 
+type SnapshotArgs struct {
+	LastIncludedTerm 	int
+	LastIncludedIndex	int
+	Snapshot			[]byte
+}
+
+type SnapshotReply struct{
+	Term				int
+}
+
+func (rf *Raft) sendInstallSnapshot(args *SnapshotArgs, reply *SnapshotReply, server int) bool{
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	// log.Printf("Peer %d received response from peer %d", rf.me, server)
+	return ok
+}
+
+/* wrapper for CondInstallSnapshot b*/
+func (rf *Raft) InstallSnapshot(args *SnapshotArgs, reply *SnapshotReply){
+	rf.CondInstallSnapshot(args.LastIncludedTerm, args.LastIncludedIndex, args.Snapshot)
+	reply.Term = rf.CurrentTerm
+}
+
 //
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
@@ -269,8 +308,52 @@ func (rf *Raft) readPersist(data []byte) {
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 
 	// Your code here (2D).
-
-	return true
+	rf.mu.Lock()
+	var logsSize = len(rf.Logs)
+	var curLastTerm = rf.Logs[logsSize-1].Term
+	var curLastIndex = rf.Logs[logsSize-1].Index
+	var doSnapshot = false
+	if curLastTerm < lastIncludedTerm{
+		doSnapshot = true
+	}else if curLastTerm == lastIncludedTerm{
+		doSnapshot = curLastIndex <= lastIncludedIndex
+	}
+	if doSnapshot {
+		if curLastTerm == lastIncludedTerm{
+			if curLastIndex == lastIncludedIndex {
+				applySnapshot := ApplyMsg{false, -1, -1, true,
+					snapshot, lastIncludedIndex, lastIncludedIndex}
+				rf.applyChan <- applySnapshot
+				rf.Logs = rf.Logs[0:1]
+				rf.persister.SaveStateAndSnapshot(rf.state2Bytes(), snapshot)
+			}else{
+				applySnapshot := ApplyMsg{false, -1, -1, true,
+					snapshot, curLastTerm, curLastIndex}
+				rf.applyChan <- applySnapshot
+				rf.Logs = rf.Logs[0:1]
+				rf.persister.SaveStateAndSnapshot(rf.state2Bytes(), snapshot)
+			}
+			rf.mu.Unlock()
+			return true
+		}else if curLastTerm < lastIncludedTerm{
+			if curLastIndex >= lastIncludedIndex{
+				/* Should not be here !!!!*/
+				log.Fatalf("Cannot do the snapshot for exceeding index")
+				rf.mu.Unlock()
+				return false
+			}else{
+				applySnapshot := ApplyMsg{false, -1, -1, true,
+					snapshot, curLastTerm, curLastIndex}
+				rf.applyChan <- applySnapshot
+				rf.Logs = rf.Logs[0:1]
+				rf.persister.SaveStateAndSnapshot(rf.state2Bytes(), snapshot)
+				rf.mu.Unlock()
+				return true
+			}
+		}
+	}
+	rf.mu.Unlock()
+	return false
 }
 
 // the service says it has created a snapshot that has
@@ -279,7 +362,60 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	/**
+	*The leader uses a new RPC called InstallSnapshot to
+	*send snapshots to followers that are too far behind; see
+	*Figure 13. When a follower receives a snapshot with this
+	*RPC, it must decide what to do with its existing log en-
+	*tries. Usually the snapshot will contain new information
+	*not already in the recipient’s log. In this case, the follower
+	*discards its entire log; it is all superseded by the snapshot
+	*and may possibly have uncommitted entries that conflict
+	*with the snapshot. If instead the follower receives a snap-
+	*shot that describes a prefix of its log (due to retransmis-
+	*sion or by mistake), then log entries covered by the snap-
+	*shot are deleted but entries following the snapshot are still
+	*valid and must be retained.
+	 */
+	rf.mu.Lock()
+	if index > rf.Logs[len(rf.Logs)-1].Index {
+		index = rf.Logs[len(rf.Logs)-1].Index
+	}
+	if index == 0{
+		/* If no logs can be snapshot, directly return. */
+		return
+	}
 
+	var curBeginIdx = rf.Logs[1].Index
+	var lengthOfLog2Snap = index - curBeginIdx
+	var snapshotLogs = rf.Logs[1:1 + lengthOfLog2Snap]
+	var newSnapshot = rf.logs2Bytes(snapshotLogs)
+	newSnapshot = append(newSnapshot, snapshot...)
+	/* apply the snapshot to other follower */
+	var lastIncludedIndex = index
+	var lastIncludedTerm = rf.Logs[1 + lengthOfLog2Snap].Term
+	if rf.role == LEADER{
+		for i := 0; i <= len(rf.peers); i++{
+			if i == rf.me{
+				continue
+			}
+			snapshotArgs := SnapshotArgs{
+				lastIncludedTerm, lastIncludedIndex,
+				newSnapshot}
+			snapshotReply := SnapshotReply{}
+			go func(args *SnapshotArgs, reply *SnapshotReply){
+				rf.sendInstallSnapshot(args, reply, i)
+			}(&snapshotArgs, &snapshotReply)
+		}
+	}
+	rf.mu.Unlock()
+	rf.CondInstallSnapshot(lastIncludedTerm, lastIncludedIndex, newSnapshot)
+	if 1 + lengthOfLog2Snap >= len(rf.Logs){
+		rf.Logs = rf.Logs[0:1]
+	}else{
+		rf.Logs = append(rf.Logs[0:1], rf.Logs[2 + lengthOfLog2Snap:]...)
+	}
+	rf.persister.SaveStateAndSnapshot(rf.state2Bytes(), newSnapshot)
 }
 
 
