@@ -19,7 +19,6 @@ package raft
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
 	"labgob"
 	"labrpc"
@@ -28,9 +27,7 @@ import (
 	"math/rand"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
-	"unsafe"
 )
 
 // import "bytes"
@@ -38,10 +35,10 @@ import (
 
 // Some global values
 // Heartbeat period of leader to send, ms.
-var heartbeatCircle int64 = 100
-var electionTimeoutGap = 100
+var heartbeatCircle int64 = 200
+var electionTimeoutGap = 150
 // Election timeout, ms.
-var electionTimeoutLower = 175
+var electionTimeoutLower = 200
 var defaultLogCapacity = 1000
 
 // debug triggers
@@ -100,18 +97,13 @@ type LogEntry struct{
 }
 
 func (le *LogEntry) toBytes() []byte{
-	var ret	[]byte
-	err := binary.Write(bytes.NewBuffer(ret[:]), binary.LittleEndian, le)
+	w := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(w)
+	err := encoder.Encode(le)
 	if err != nil{
-		log.Println(err.Error())
-		// If failed to write LogEntry to []byte, then filled a []byte with 0 which has a same size as LogEntry
-		err = binary.Write(bytes.NewBuffer(ret[:]), binary.LittleEndian, make([]byte, int(unsafe.Sizeof(LogEntry{}))))
-		if err != nil{
-			log.Println(err.Error())
-			syscall.Exit(-1)
-		}
+		log.Printf("Failed to transfer log entry to bytes. ")
 	}
-	return ret
+	return w.Bytes()
 }
 
 /* Called when doing snapshot, while turning to bytes, can also apply to tester*/
@@ -155,6 +147,7 @@ type Raft struct {
 
 
 	lastHeartbeatUnixTime		int64			// Record for the system time of last heartbeat (unix time nano)
+	commitIndexMap			map[int]int		// Map about the nextIndex array
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -177,6 +170,9 @@ func (rf *Raft) turnToLeader() {
 		}
 		rf.matchIndex[i] = 0
 	}
+	rf.commitIndexMap = make(map[int]int)
+	rf.commitIndexMap[0] = len(rf.peers)-1
+
 }
 
 func (rf *Raft) GetVoteForLocked() int{
@@ -572,27 +568,43 @@ type AppendEntriesArgs struct{
 type AppendEntriesReply struct{
 	Term			int			// Term of the follower
 	Success			bool 		// TODO: used for matching entries
+	LastTerm		int		/* When success is not zero, then it represent the term of the
+	last log entry of the follower */
+	LastIndex		int		/* When success is non-zero, then it represnet the index of the
+	last log entry of the follower */
 }
 
 func (rf*Raft) followerUpdateCommitIndex(args *AppendEntriesArgs){
 	if args.LeaderCommit > rf.committedIndex{
 		newCommitted := int(math.Min(float64(args.LeaderCommit), float64(rf.Logs[len(rf.Logs)-1].Index)))
 		/* Apply log changes to tester too */
-		var newLogs []LogEntry
+		var beginIndex 	int
+		var endIndex	int	// Exclusive
 		if rf.committedIndex < newCommitted{
-			newLogs = rf.Logs[rf.committedIndex+1:newCommitted+1]
+			beginIndex = rf.committedIndex+1
+			endIndex = newCommitted + 1
 		}else{
-			newLogs = rf.Logs[0: newCommitted + 1]
+			beginIndex = 0
+			endIndex = newCommitted + 1
 		}
 		doChangeCommitted := false
-		for _, e := range newLogs{
+		for i := beginIndex; i < endIndex; i++{
 			/* 	Test2BReJoin: HeartBeat before really distributed some entries may pass a false
 			information telling the raft to committed entries that was not existed in the
 			current leader's log. For example, a reconnected previous leader may has different log in
 			new leader's committedIndex, a heartbeat like this may apply wrong data to state
 			machine! , so we need to check the log entry's term */
+			var e = rf.Logs[i]
 			if args.Entries == nil && e.Term < rf.CurrentTerm {
 				break
+			}
+			if e.Index == 1{
+				/* Before apply index 1 log, apply the dummy log */
+				initApplyMsg := ApplyMsg{}
+				initApplyMsg.Command = rf.Logs[0].Info
+				initApplyMsg.CommandValid = true
+				initApplyMsg.CommandIndex = 0
+				rf.applyChan <- initApplyMsg
 			}
 			rf.applyMessage2Tester(e)
 			doChangeCommitted = true
@@ -629,6 +641,8 @@ func (rf*Raft) doAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRepl
 			logs in leader to this server, but we should do it step
 			by step by using appendEntriesRPC and nextIndex[] go back */
 			reply.Success = false
+			reply.LastTerm = rf.Logs[len(rf.Logs)-1].Term
+			reply.LastIndex = rf.Logs[len(rf.Logs)-1].Index
 		}
 	}else{
 		//if rf.Logs[len(rf.Logs)-1].Term == args.PrevLogTerm &&
@@ -692,6 +706,8 @@ func (rf*Raft) doAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRepl
 				rf.Logs = rf.Logs[0: args.PrevLogIndex]
 				rf.persist()
 			}
+			reply.LastTerm = rf.Logs[len(rf.Logs)-1].Term
+			reply.LastIndex = rf.Logs[len(rf.Logs)-1].Index
 		}else{
 			reply.Success = true
 			reply.Term = rf.CurrentTerm
@@ -727,6 +743,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				/* Heartbeat  */
 				if rf.Logs[len(rf.Logs)-1].Index <= args.PrevLogIndex{
 					reply.Success = false
+					reply.LastTerm = rf.Logs[len(rf.Logs)-1].Term
+					reply.LastIndex = rf.Logs[len(rf.Logs)-1].Index
 				}else {
 					rf.followerUpdateCommitIndex(args)
 				}
@@ -750,6 +768,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}else{
 				if rf.Logs[len(rf.Logs)-1].Index <= args.PrevLogIndex{
 					reply.Success = false
+					reply.LastTerm = rf.Logs[len(rf.Logs)-1].Term
+					reply.LastIndex = rf.Logs[len(rf.Logs)-1].Index
 				}else {
 					rf.followerUpdateCommitIndex(args)
 				}
@@ -776,7 +796,11 @@ func (rf *Raft) applyMessage2Tester(logEntry LogEntry){
 	msg.CommandIndex = logEntry.Index
 	msg.Command = logEntry.Info
 	msg.CommandValid = true
-	replicationDebug(fmt.Sprintf("Peer%d(%d) apply log%d with command %d to tester", rf.me, rf.role,
+	role := "Follower"
+	if rf.role == LEADER {
+		role = "Leader"
+	}
+	replicationDebug(fmt.Sprintf("%v%d apply log%d with command %d to tester", role, rf.me,
 		logEntry.Index,	logEntry.Info))
 	rf.applyChan <- msg
 }
@@ -803,6 +827,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := rf.role == LEADER
 	// Your code here (2B).
 	if len(rf.Logs) == 1{
+		/* TODO: What if server crashed immediately after snapshot */
 		index = 1
 	}else{
 		index = rf.Logs[len(rf.Logs)-1].Index + 1
@@ -817,7 +842,18 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		newLogEntry := LogEntry{term, index, command}
 		rf.Logs = append(rf.Logs, newLogEntry)
 		rf.persist()
-		rf.distributeAppendEntries(false)
+		var oneFail 		bool
+		var leaderCommitted	bool
+		var disconnected	int
+		var maxDisconnect = (len(rf.peers)-1) / 2
+		for oneFail, leaderCommitted, disconnected = rf.distributeAppendEntries(); (oneFail || !leaderCommitted) &&
+			disconnected <= maxDisconnect;{
+			time.Sleep(time.Millisecond * 10)
+			oneFail, leaderCommitted, disconnected= rf.distributeAppendEntries()
+		}
+		if rf.role == LEADER && leaderCommitted && disconnected <= maxDisconnect{
+			rf.distributeAppendEntries()
+		}
 		//for rf.distributeAppendEntries(false) != 1{
 		//	if rf.killed(){
 		//		break
@@ -859,31 +895,36 @@ type AppendEntriesCallResponse struct{
 	Success 		int		/* 0 means success, integer greater than 0 represent
 								failed , -1 means server lost connection */
 	ID				int		/* ID of the response server */
+	LastTerm		int		/* When success is not zero, then it represent the term of the
+								last log entry of the follower */
+	LastIndex		int		/* When success is non-zero, then it represnet the index of the
+								last log entry of the follower */
 }
 
-func (rf *Raft) leaderUpdateCommitIndex(){
-	commitIndexMap := make(map[int]int)
-	for i := 0; i < len(rf.peers); i++{
-		if i == rf.me{
-			continue
-		}
-		if v, ok:= commitIndexMap[rf.matchIndex[i]]; ok{
-			commitIndexMap[rf.matchIndex[i]] = v + 1
-		}else{
-			commitIndexMap[rf.matchIndex[i]] = 2
-		}
-	}
-	for k, v := range commitIndexMap{
+func (rf *Raft) leaderUpdateCommitIndex() bool{
+	var ret = false
+	for k, v := range rf.commitIndexMap{
 		if v > (len(rf.peers))/2{
 			if k > rf.committedIndex && rf.Logs[k].Term == rf.CurrentTerm {
 				/* Apply the committed log to tester*/
-				newLogs := rf.Logs[rf.committedIndex+1:k+1]
-				for _, l := range newLogs{
+				var beginIndex = rf.committedIndex+1
+				var endIndex = k + 1		//exclusive
+				for i := beginIndex ; i < endIndex; i++{
+					l := rf.Logs[i]
+					if l.Index == 1{
+						/* Before apply index 1 log, apply the dummy log */
+						initApplyMsg := ApplyMsg{}
+						initApplyMsg.Command = rf.Logs[0].Info
+						initApplyMsg.CommandValid = true
+						initApplyMsg.CommandIndex = 0
+						rf.applyChan <- initApplyMsg
+					}
 					rf.applyMessage2Tester(l)
 				}
 				rf.committedIndex = k
 				replicationDebug(fmt.Sprintf("Leader%d's nextIndex[]:%d, matchIndex[]: %d", rf.me,
 					rf.nextIndex, rf.matchIndex))
+				ret = true
 				//for i := 0; i < len(rf.peers); i++{
 				//	if i == rf.me{
 				//		continue
@@ -894,14 +935,17 @@ func (rf *Raft) leaderUpdateCommitIndex(){
 			break
 		}
 	}
+	return ret
 }
 
 /* return whether the appendEntries for all servers succeed, if not return false,
  *and inform the leader to distribute again. If it is a heartbeat, then always return true.
  * Return 0 means retry, return 1 means ok, and 2 means turn heartbeat to append entries
  */
-func (rf *Raft) distributeAppendEntries(heartbeat bool) int {
+func (rf *Raft) distributeAppendEntries()  (oneFail bool, updateCommitted bool, disconnected int) {
 	responseChan := make(chan AppendEntriesCallResponse, len(rf.peers))
+	oneFail = false
+	updateCommitted = false
 	ret := 1
 	for i := 0; i < len(rf.peers)&&!rf.killed(); i++{
 		if i == rf.me{
@@ -939,19 +983,24 @@ func (rf *Raft) distributeAppendEntries(heartbeat bool) int {
 		go func(reChan chan AppendEntriesCallResponse, followerId int, sender *Raft, appendArg *AppendEntriesArgs,
 			reply *AppendEntriesReply){
 			if !sender.sendAppendEntries(followerId, appendArg, reply){
-				reChan <- AppendEntriesCallResponse{-1, followerId}
+				reChan <- AppendEntriesCallResponse{-1, followerId,
+					reply.LastTerm, reply.LastIndex}
 				return
 			}
 			if reply.Success{
-				reChan <- AppendEntriesCallResponse{0, followerId}
+				reChan <- AppendEntriesCallResponse{0, followerId,
+					reply.LastTerm, reply.LastIndex}
 			}else{
-				reChan <- AppendEntriesCallResponse{reply.Term, followerId}
+				reChan <- AppendEntriesCallResponse{reply.Term, followerId,
+					reply.LastTerm, reply.LastIndex}
 			}
 		}(responseChan, i, rf, &args, &appendEntriesReply)
 	}
 	/* If normal append entries rpc didn't reach one of the servers, the
 	leader will retry to send the append entries rpc until all */
-	for round:=1; round < len(rf.peers); round++{
+
+	var disconnect	= 0
+	for round:=1; round < len(rf.peers) && disconnect < (len(rf.peers)+1)/2 ; round++{
 		var val AppendEntriesCallResponse
 		select {
 			case val = <-responseChan:
@@ -959,29 +1008,46 @@ func (rf *Raft) distributeAppendEntries(heartbeat bool) int {
 					rf.CurrentTerm = val.Success
 					rf.persist()
 					rf.role = FOLLOWER
-					return ret
+					updateCommitted = true
+					return
 				}else if val.Success > 0 && rf.CurrentTerm == val.Success{
 					/* If terms of leader and the follower are the same, then
 					the only reason why the follower reject the appendEntriesRPC
 					is that the term of prevLogIndex in the follower doesn't match
 					prevLogTerm */
-					delta := rf.Logs[len(rf.Logs)-1].Index - rf.nextIndex[val.ID]
-					if delta < 2 {
-						rf.nextIndex[val.ID] -= 1
-					}else if delta >= 2 && delta <=10{
-						rf.nextIndex[val.ID] -= 5
+					if val.LastTerm == rf.Logs[len(rf.Logs)-2].Term || val.LastTerm == rf.Logs[len(rf.Logs)-1].Term{
+						rf.nextIndex[val.ID] = val.LastIndex + 1
 					}else{
-						rf.nextIndex[val.ID] -= delta
-					}
-					if rf.nextIndex[val.ID] <= 0{
 						rf.nextIndex[val.ID] = 1
+						//delta := rf.Logs[len(rf.Logs)-1].Index - rf.nextIndex[val.ID]
+						//if delta < 2 {
+						//	rf.nextIndex[val.ID] -= 3
+						//}else if delta >= 2 && delta <=7{
+						//	rf.nextIndex[val.ID] -= 5
+						//}else{
+						//	rf.nextIndex[val.ID] -= delta
+						//}
+						//if rf.nextIndex[val.ID] <= 0{
+						//	rf.nextIndex[val.ID] = 1
+						//}
 					}
 					replicationDebug(fmt.Sprintf("Peer%d failed to get new log entry, decrease nextIndex to% d",
 						val.ID, rf.nextIndex[val.ID]))
+					oneFail = true
 					ret = 0
-				}else if val.Success == 0{
+				}else if val.Success == 0 {
+					rf.commitIndexMap[rf.matchIndex[val.ID]] -= 1
+					if rf.commitIndexMap[rf.matchIndex[val.ID]] <= 1{
+						delete(rf.commitIndexMap, rf.matchIndex[val.ID])
+					}
 					rf.nextIndex[val.ID] = rf.Logs[len(rf.Logs)-1].Index + 1
 					rf.matchIndex[val.ID] = rf.nextIndex[val.ID] - 1
+					if _, ok := rf.commitIndexMap[rf.matchIndex[val.ID]]; ok{
+						rf.commitIndexMap[rf.matchIndex[val.ID]] += 1
+					} else{
+						rf.commitIndexMap[rf.matchIndex[val.ID]] = 2
+					}
+					ret = 1
 				}else{
 					/* lost connection with val.ID or server didn't reply in time */
 					//log.Printf( "Leader%d think peer%d lost connection", rf.me,
@@ -989,17 +1055,19 @@ func (rf *Raft) distributeAppendEntries(heartbeat bool) int {
 					ret = 0
 				}
 				break
-			case <-time.After(time.Millisecond*time.Duration(int(heartbeatCircle)/len(rf.peers))):
+			case <-time.After(time.Millisecond*10):
 				/* lost connection with val.ID or server didn't reply in time */
 				/* TODO: Under this situation, does the leader need to retry send
 				AppendEntriesRPC */
+				disconnect += 1
 				break
 		}
 	}
 	if ret == 1 {
-		rf.leaderUpdateCommitIndex()
+		updateCommitted = rf.leaderUpdateCommitIndex()
 	}
-	return ret
+	disconnected = disconnect
+	return
 }
 
 func (rf *Raft) startElection(timeout int){
@@ -1045,13 +1113,11 @@ func (rf *Raft) startElection(timeout int){
 	}
 
 	// Wait for the vote result, if timeout then the peer treat the other peer didn't vote for it.
-	beChosen 	:= 0
-	counter 	:= 1
-	votes		:= 1	// one votes for itself
-	runOutOfTime := false
-	timer := time.NewTicker(time.Duration(timeout) * time.Millisecond)
-	defer timer.Stop()
-	for ; counter < len(rf.peers) && !runOutOfTime; {
+	var beChosen 	= 0
+	var counter 	= 1
+	var votes		= 1	// one votes for itself
+	var disconnect  = 0
+	for ; counter < len(rf.peers) && disconnect < (len(rf.peers)+1)/2; {
 		// log.Printf("Peer %d wait for votes result", rf.me)
 		val := 0
 		select{
@@ -1074,11 +1140,9 @@ func (rf *Raft) startElection(timeout int){
 				}
 				counter += 1
 				break
-			//case <-time.After(time.Millisecond* 20):
-			//	counter += 1
-			//	break
-			case <-timer.C:
-				runOutOfTime = true
+			case <-time.After(time.Millisecond* 10):
+				disconnect += 1
+				counter += 1
 				break
 		}
 		//log.Printf("Peer %d receive %d votes", rf.me, votes)
@@ -1107,7 +1171,7 @@ func (rf *Raft) startElection(timeout int){
 		}
 		/* Send heartbeat twice since we need to wait the timeout of election */
 
-		rf.distributeAppendEntries( false)
+		rf.distributeAppendEntries()
 		rf.mu.Unlock()
 		//log.Printf("Peer %d is leader and finish first round of heartbeat!",
 			//rf.me)
@@ -1136,12 +1200,12 @@ func (rf *Raft) ticker() {
 			if rf.killed(){
 				return
 			}
-			rf.distributeAppendEntries( false)
+			rf.distributeAppendEntries()
 			//for rf.distributeAppendEntries( false) != 1{
 			//	time.Sleep(time.Millisecond * 10)
 			//}
 			rf.mu.Unlock()
-			time.Sleep(time.Millisecond * time.Duration(int(heartbeatCircle)/len(rf.peers)))
+			time.Sleep(time.Millisecond * time.Duration(int(heartbeatCircle)-10))
 		}else if rf.role == FOLLOWER{
 			curSecond := time.Now().UnixNano()
 			difference := curSecond - rf.lastHeartbeatUnixTime
@@ -1215,25 +1279,23 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.VotedFor = -1
 	rf.CurrentTerm = 0
 	// Set default size of logs to 1000
-	rf.Logs = make([]LogEntry, 0, defaultLogCapacity)
-	// Add an empty log entry for holding the 0-index place
-	rf.Logs = append(rf.Logs, LogEntry{-1, 0 , -1})
-	initApplyMsg := ApplyMsg{}
-	initApplyMsg.Command = -1
-	initApplyMsg.CommandValid = true
-	initApplyMsg.CommandIndex = 0
-	rf.applyChan <- initApplyMsg
 
 	// Reinitialized after election, only held by leaders.
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
 
 	// Other properties
-	rf.lastHeartbeatUnixTime = 0
+	rf.lastHeartbeatUnixTime = time.Now().UnixNano()
 	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	if rf.Logs == nil{
+		rf.Logs = make([]LogEntry, 0, defaultLogCapacity)
+		// Add an empty log entry for holding the 0-index place
+		rf.Logs = append(rf.Logs, LogEntry{-1, 0 , -1})
+		rf.persist()
+	}
 
 	// log.Printf("Successfully make peer %d.\n", rf.me)
 
