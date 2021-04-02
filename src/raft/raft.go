@@ -42,7 +42,7 @@ var electionTimeoutLower = 200
 var defaultLogCapacity = 1000
 
 // debug triggers
-var electionDebugEnable =false
+var electionDebugEnable = false
 var replicationDebugEnable = false
 
 func electionDebug(s string){
@@ -148,6 +148,8 @@ type Raft struct {
 
 	lastHeartbeatUnixTime	int64			// Record for the system time of last heartbeat (unix time nano)
 	commitIndexMap			map[int]int		// Map about the nextIndex array
+	updateFollowers			bool			// Indicate that the next Raft::distributedAppendEntries() is used by the
+										// leader to update followers commitIndex
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -704,7 +706,7 @@ func (rf*Raft) doAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRepl
 		//	log.Printf("Enter the wrong branch when append entries!")
 		//	reply.Success = false
 		//}
-		if args.PrevLogIndex >= len(rf.Logs) || rf.Logs[args.PrevLogIndex].Term != args.PrevLogTerm{
+		if args.PrevLogIndex > rf.Logs[len(rf.Logs)-1].Index || rf.Logs[args.PrevLogIndex].Term != args.PrevLogTerm{
 			reply.Success = false
 			reply.Term = rf.CurrentTerm
 			if args.PrevLogIndex < len(rf.Logs){
@@ -742,7 +744,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.Term = rf.CurrentTerm
 			reply.Success = true
 			/* Not a heartbeat */
-			if args.Entries != nil{
+			if args.Entries != nil && args.Entries[0].Term != 0{
+				/* args.Entries[0].Term == 0 means leader informs followers to
+				update its committedIndex*/
 				rf.doAppendEntries(args, reply)
 			}else{
 				/* Heartbeat  */
@@ -768,7 +772,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.persist()
 			reply.Term = args.Term
 			reply.Success = true
-			if args.Entries != nil{
+			if args.Entries != nil && args.Entries[0].Term != 0{
+				/* args.Entries[0].Term == 0 means leader informs followers to
+				update its committedIndex*/
 				rf.doAppendEntries(args, reply)
 			}else{
 				if rf.Logs[len(rf.Logs)-1].Index <= args.PrevLogIndex{
@@ -860,6 +866,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		if rf.role != LEADER{
 			/* If it is not a leader, then remove the newly added log entry */
 			rf.Logs = rf.Logs[:len(rf.Logs)-1]
+			rf.persist()
 			isLeader = false
 		}
 		//rf.distributeAppendEntries()
@@ -995,7 +1002,11 @@ func (rf *Raft) distributeAppendEntries()  (updateCommitted bool) {
 				reject the leader or lost connection with the leader, then here
 				send a heartbeat to this server is enough since it doesn't need to apply
 				new logs */
-				args.Entries = nil
+				if !rf.updateFollowers{
+					args.Entries = nil
+				}else{
+					args.Entries = []LogEntry{{0, 0, -1}}
+				}
 			}
 			go func(reChan chan AppendEntriesCallResponse, followerId int, sender *Raft, appendArg *AppendEntriesArgs,
 				reply *AppendEntriesReply) {
@@ -1083,12 +1094,16 @@ func (rf *Raft) distributeAppendEntries()  (updateCommitted bool) {
 		}
 		followersNeedAppend = updateFollowersNeedAppend
 	}
+	if rf.updateFollowers{
+		rf.updateFollowers = false
+	}
 	if notALeader{
 		updateCommitted = false
 		return
 	}
 	if doUpdateCommitted {
 		updateCommitted = rf.leaderUpdateCommitIndex()
+		rf.updateFollowers = updateCommitted
 	}
 	return
 }
@@ -1315,6 +1330,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Other properties
 	rf.lastHeartbeatUnixTime = time.Now().UnixNano()
+	rf.updateFollowers = false
 	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash
