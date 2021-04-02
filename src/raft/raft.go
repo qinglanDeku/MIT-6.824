@@ -43,7 +43,7 @@ var defaultLogCapacity = 1000
 
 // debug triggers
 var electionDebugEnable = false
-var replicationDebugEnable = false
+var replicationDebugEnable = true
 
 func electionDebug(s string){
 	if electionDebugEnable{
@@ -111,9 +111,6 @@ func (rf *Raft) logs2Bytes(logs []LogEntry) []byte{
 	var retBytes = make([]byte, 0)
 	for _, entry := range logs{
 		newBytes := entry.toBytes()
-		msg := ApplyMsg{false, -1, -1, true,
-			newBytes, entry.Term, entry.Index}
-		rf.applyChan <- msg
 		retBytes = append(retBytes, newBytes...)
 	}
 	return retBytes
@@ -161,14 +158,7 @@ func (rf *Raft) turnToLeader() {
 		if i == rf.me {
 			continue
 		}
-		if len(rf.Logs) == 1{
-			rf.nextIndex[i] = 1
-		}else{
-			rf.nextIndex[i] = rf.Logs[len(rf.Logs)-1].Index + 1
-			if rf.Logs[len(rf.Logs)-1].Index + 1 != len(rf.Logs){
-				log.Printf("Wrong index!%d", len(rf.Logs))
-			}
-		}
+		rf.nextIndex[i] = rf.Logs[len(rf.Logs)-1].Index + 1
 		rf.matchIndex[i] = 0
 	}
 	rf.commitIndexMap = make(map[int]int)
@@ -310,51 +300,51 @@ func (rf *Raft) InstallSnapshot(args *SnapshotArgs, reply *SnapshotReply){
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 
 	// Your code here (2D).
-	rf.mu.Lock()
-	var logsSize = len(rf.Logs)
-	var curLastTerm = rf.Logs[logsSize-1].Term
-	var curLastIndex = rf.Logs[logsSize-1].Index
-	var doSnapshot = false
-	if curLastTerm < lastIncludedTerm{
-		doSnapshot = true
-	}else if curLastTerm == lastIncludedTerm{
-		doSnapshot = curLastIndex <= lastIncludedIndex
-	}
-	if doSnapshot {
-		if curLastTerm == lastIncludedTerm{
-			if curLastIndex == lastIncludedIndex {
-				applySnapshot := ApplyMsg{false, -1, -1, true,
-					snapshot, lastIncludedIndex, lastIncludedIndex}
-				rf.applyChan <- applySnapshot
-				rf.Logs = rf.Logs[0:1]
-				rf.persister.SaveStateAndSnapshot(rf.state2Bytes(), snapshot)
-			}else{
-				applySnapshot := ApplyMsg{false, -1, -1, true,
-					snapshot, curLastTerm, curLastIndex}
-				rf.applyChan <- applySnapshot
-				rf.Logs = rf.Logs[0:1]
-				rf.persister.SaveStateAndSnapshot(rf.state2Bytes(), snapshot)
-			}
-			rf.mu.Unlock()
-			return true
-		}else if curLastTerm < lastIncludedTerm{
-			if curLastIndex >= lastIncludedIndex{
-				/* Should not be here !!!!*/
-				log.Fatalf("Cannot do the snapshot for exceeding index")
-				rf.mu.Unlock()
-				return false
-			}else{
-				applySnapshot := ApplyMsg{false, -1, -1, true,
-					snapshot, curLastTerm, curLastIndex}
-				rf.applyChan <- applySnapshot
-				rf.Logs = rf.Logs[0:1]
-				rf.persister.SaveStateAndSnapshot(rf.state2Bytes(), snapshot)
-				rf.mu.Unlock()
-				return true
-			}
-		}
-	}
-	rf.mu.Unlock()
+	//rf.mu.Lock()
+	//var logsSize = len(rf.Logs)
+	//var curLastTerm = rf.Logs[logsSize-1].Term
+	//var curLastIndex = rf.Logs[logsSize-1].Index
+	//var doSnapshot = false
+	//if curLastTerm < lastIncludedTerm{
+	//	doSnapshot = true
+	//}else if curLastTerm == lastIncludedTerm{
+	//	doSnapshot = curLastIndex <= lastIncludedIndex
+	//}
+	//if doSnapshot {
+	//	if curLastTerm == lastIncludedTerm{
+	//		if curLastIndex == lastIncludedIndex {
+	//			applySnapshot := ApplyMsg{false, -1, -1, true,
+	//				snapshot, lastIncludedIndex, lastIncludedIndex}
+	//			rf.applyChan <- applySnapshot
+	//			rf.Logs = rf.Logs[0:1]
+	//			rf.persister.SaveStateAndSnapshot(rf.state2Bytes(), snapshot)
+	//		}else{
+	//			applySnapshot := ApplyMsg{false, -1, -1, true,
+	//				snapshot, curLastTerm, curLastIndex}
+	//			rf.applyChan <- applySnapshot
+	//			rf.Logs = rf.Logs[0:1]
+	//			rf.persister.SaveStateAndSnapshot(rf.state2Bytes(), snapshot)
+	//		}
+	//		rf.mu.Unlock()
+	//		return true
+	//	}else if curLastTerm < lastIncludedTerm{
+	//		if curLastIndex >= lastIncludedIndex{
+	//			/* Should not be here !!!!*/
+	//			log.Fatalf("Cannot do the snapshot for exceeding index")
+	//			rf.mu.Unlock()
+	//			return false
+	//		}else{
+	//			applySnapshot := ApplyMsg{false, -1, -1, true,
+	//				snapshot, curLastTerm, curLastIndex}
+	//			rf.applyChan <- applySnapshot
+	//			rf.Logs = rf.Logs[0:1]
+	//			rf.persister.SaveStateAndSnapshot(rf.state2Bytes(), snapshot)
+	//			rf.mu.Unlock()
+	//			return true
+	//		}
+	//	}
+	//}
+	//rf.mu.Unlock()
 	return false
 }
 
@@ -385,39 +375,31 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	}
 	if index == 0{
 		/* If no logs can be snapshot, directly return. */
+		rf.mu.Unlock()
 		return
 	}
-
-	var curBeginIdx = rf.Logs[1].Index
-	var lengthOfLog2Snap = index - curBeginIdx
-	var snapshotLogs = rf.Logs[1:1 + lengthOfLog2Snap]
+	var curBeginIdx = rf.Logs[0].Index
+	var lengthOfLog2Snap = index - curBeginIdx+1
+	var snapshotLogs = rf.Logs[:1 + lengthOfLog2Snap]
 	var newSnapshot = rf.logs2Bytes(snapshotLogs)
 	newSnapshot = append(newSnapshot, snapshot...)
-	/* apply the snapshot to other follower */
-	var lastIncludedIndex = index
-	var lastIncludedTerm = rf.Logs[1 + lengthOfLog2Snap].Term
-	if rf.role == LEADER{
-		for i := 0; i <= len(rf.peers); i++{
-			if i == rf.me{
-				continue
-			}
-			snapshotArgs := SnapshotArgs{
-				lastIncludedTerm, lastIncludedIndex,
-				newSnapshot}
-			snapshotReply := SnapshotReply{}
-			go func(args *SnapshotArgs, reply *SnapshotReply){
-				rf.sendInstallSnapshot(args, reply, i)
-			}(&snapshotArgs, &snapshotReply)
-		}
-	}
-	rf.mu.Unlock()
-	rf.CondInstallSnapshot(lastIncludedTerm, lastIncludedIndex, newSnapshot)
-	if 1 + lengthOfLog2Snap >= len(rf.Logs){
+	//var lastIncludedIndex = index
+	//var lastIncludedTerm = rf.Logs[index-curBeginIdx].Term
+	if lengthOfLog2Snap >= len(rf.Logs){
 		rf.Logs = rf.Logs[0:1]
 	}else{
-		rf.Logs = append(rf.Logs[0:1], rf.Logs[2 + lengthOfLog2Snap:]...)
+		rf.Logs = rf.Logs[index-curBeginIdx + 1:]
 	}
+	log.Printf("snapshot: peer: %v, snapshot length: %v, logs after snapshot:%v", rf.me, lengthOfLog2Snap, rf.Logs)
 	rf.persister.SaveStateAndSnapshot(rf.state2Bytes(), newSnapshot)
+	rf.mu.Unlock()
+	//var msg = ApplyMsg{}
+	//msg.CommandValid = false
+	//msg.SnapshotValid = true
+	//msg.SnapshotIndex = lastIncludedIndex
+	//msg.SnapshotTerm = lastIncludedTerm
+	//rf.applyChan <- msg
+	//rf.mu.Unlock()
 }
 
 
@@ -502,7 +484,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = false
 	}else{
 		if rf.VotedFor == -1 || rf.VotedFor == args.CandidateID{
-			if len(rf.Logs) == 1 || args.LastLogTerm > rf.Logs[len(rf.Logs)-1].Term ||
+			if (len(rf.Logs) == 1 && rf.Logs[0].Index == 0) || args.LastLogTerm > rf.Logs[len(rf.Logs)-1].Term ||
 				(args.LastLogTerm == rf.Logs[len(rf.Logs)-1].Term && args.LastLogIndex >= rf.Logs[len(rf.Logs)-1].Index) {
 				rf.role = FOLLOWER
 				rf.VotedFor = args.CandidateID
@@ -510,7 +492,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				rf.persist()
 				rf.lastHeartbeatUnixTime = time.Now().UnixNano()
 				electionDebug(fmt.Sprintf("Peer %d voted for Peer %d::%v, %v, %v, 2. Logs: %v", rf.me, args.CandidateID,
-					len(rf.Logs) == 1, args.LastLogTerm > rf.Logs[len(rf.Logs)-1].Term,
+					len(rf.Logs) == 1 && rf.Logs[0].Index == 0, args.LastLogTerm > rf.Logs[len(rf.Logs)-1].Term,
 					args.LastLogTerm == rf.Logs[len(rf.Logs)-1].Term && args.LastLogIndex >= rf.Logs[len(rf.Logs)-1].Index,
 					rf.Logs))
 				reply.Term = args.Term
@@ -600,7 +582,7 @@ func (rf*Raft) followerUpdateCommitIndex(args *AppendEntriesArgs){
 			current leader's log. For example, a reconnected previous leader may has different log in
 			new leader's committedIndex, a heartbeat like this may apply wrong data to state
 			machine! , so we need to check the log entry's term */
-			var e = rf.Logs[i]
+			var e = rf.Logs[i-rf.Logs[0].Index]
 			if args.Entries == nil && e.Term < rf.CurrentTerm {
 				break
 			}
@@ -637,7 +619,7 @@ func (rf*Raft) doAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRepl
 	replicationDebug(fmt.Sprint("Peer ", rf.me, " current term: ", rf.CurrentTerm, "  PrevLogTerm:",
 		args.PrevLogTerm, "  PrevLogIndex: ", args.PrevLogIndex,
 		"  newEntries: ", args.Entries, "  origin logs: ", rf.Logs))
-	if len(rf.Logs) == 1{
+	if len(rf.Logs) == 1 && rf.Logs[0].Index == 0{
 		if args.PrevLogIndex == 0{
 			reply.Success = true
 			rf.Logs = append(rf.Logs, args.Entries...)
@@ -706,11 +688,12 @@ func (rf*Raft) doAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRepl
 		//	log.Printf("Enter the wrong branch when append entries!")
 		//	reply.Success = false
 		//}
-		if args.PrevLogIndex > rf.Logs[len(rf.Logs)-1].Index || rf.Logs[args.PrevLogIndex].Term != args.PrevLogTerm{
+		if args.PrevLogIndex > rf.Logs[len(rf.Logs)-1].Index ||
+			rf.Logs[args.PrevLogIndex-rf.Logs[0].Index].Term != args.PrevLogTerm{
 			reply.Success = false
 			reply.Term = rf.CurrentTerm
 			if args.PrevLogIndex < len(rf.Logs){
-				rf.Logs = rf.Logs[0: args.PrevLogIndex]
+				rf.Logs = rf.Logs[0: args.PrevLogIndex-rf.Logs[0].Index+1]
 				rf.persist()
 			}
 			reply.LastTerm = rf.Logs[len(rf.Logs)-1].Term
@@ -718,7 +701,7 @@ func (rf*Raft) doAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRepl
 		}else{
 			reply.Success = true
 			reply.Term = rf.CurrentTerm
-			rf.Logs = append(rf.Logs[0: args.PrevLogIndex+1],  args.Entries...)
+			rf.Logs = append(rf.Logs[0: args.PrevLogIndex-rf.Logs[0].Index+1],  args.Entries...)
 			rf.persist()
 			rf.followerUpdateCommitIndex(args)
 		}
@@ -836,13 +819,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := -1
 	rf.mu.Lock()
 	isLeader := rf.role == LEADER
-	// Your code here (2B).
-	if len(rf.Logs) == 1{
-		/* TODO: What if server crashed immediately after snapshot */
-		index = 1
-	}else{
-		index = rf.Logs[len(rf.Logs)-1].Index + 1
-	}
+	index = rf.Logs[len(rf.Logs)-1].Index + 1
 	term = rf.CurrentTerm
 	if rf.killed(){
 		rf.mu.Unlock()
@@ -853,9 +830,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		newLogEntry := LogEntry{term, index, command}
 		rf.Logs = append(rf.Logs, newLogEntry)
 		rf.persist()
-		rf.commitIndexMap[rf.Logs[len(rf.Logs)-2].Index] -= 1
-		if rf.commitIndexMap[rf.Logs[len(rf.Logs)-2].Index] == 0{
-			delete(rf.commitIndexMap, rf.Logs[len(rf.Logs)-2].Index)
+		rf.commitIndexMap[rf.Logs[len(rf.Logs)-1].Index-1] -= 1
+		if rf.commitIndexMap[rf.Logs[len(rf.Logs)-1].Index-1] == 0{
+			delete(rf.commitIndexMap, rf.Logs[len(rf.Logs)-1].Index-1)
 		}
 		rf.commitIndexMap[rf.Logs[len(rf.Logs)-1].Index] = 1
 		//var updateFollowers = rf.distributeAppendEntries()
@@ -921,12 +898,12 @@ func (rf *Raft) leaderUpdateCommitIndex() bool{
 	var ret = false
 	for k, v := range rf.commitIndexMap{
 		if v > (len(rf.peers))/2{
-			if k > rf.committedIndex && rf.Logs[k].Term == rf.CurrentTerm {
+			if k > rf.committedIndex && rf.Logs[k-rf.Logs[0].Index].Term == rf.CurrentTerm {
 				/* Apply the committed log to tester*/
 				var beginIndex = rf.committedIndex+1
 				var endIndex = k + 1		//exclusive
 				for i := beginIndex ; i < endIndex; i++{
-					l := rf.Logs[i]
+					l := rf.Logs[i-rf.Logs[0].Index]
 					if l.Index == 1{
 						/* Before apply index 1 log, apply the dummy log */
 						initApplyMsg := ApplyMsg{}
@@ -987,16 +964,23 @@ func (rf *Raft) distributeAppendEntries()  (updateCommitted bool) {
 			appendEntriesReply := AppendEntriesReply{}
 			if rf.nextIndex[i] <= rf.Logs[len(rf.Logs)-1].Index {
 				if rf.nextIndex[i] > 0 {
-					args.PrevLogIndex = rf.Logs[rf.nextIndex[i]-1].Index
-					args.PrevLogTerm = rf.Logs[rf.nextIndex[i]-1].Term
+					args.PrevLogIndex = rf.Logs[rf.nextIndex[i]-rf.Logs[0].Index-1].Index
+					args.PrevLogTerm = rf.Logs[rf.nextIndex[i]-rf.Logs[0].Index-1].Term
 				} else {
-					rf.nextIndex[i] = 1
-					args.PrevLogIndex = 0
-					args.PrevLogTerm = rf.Logs[0].Term
+					if rf.Logs[0].Index == 0{
+						rf.nextIndex[i] = rf.Logs[0].Index + 1
+						args.PrevLogIndex = rf.Logs[0].Index
+						args.PrevLogTerm = rf.Logs[0].Term
+					}else{
+						rf.nextIndex[i] = rf.Logs[0].Index
+						args.PrevLogIndex = rf.Logs[0].Index - 1
+						args.PrevLogTerm = rf.Logs[0].Term
+					}
+
 				}
 			}
 			if rf.nextIndex[i] <= rf.Logs[len(rf.Logs)-1].Index {
-				args.Entries = rf.Logs[rf.nextIndex[i]:len(rf.Logs)]
+				args.Entries = rf.Logs[rf.nextIndex[i]-rf.Logs[0].Index:len(rf.Logs)]
 			} else {
 				/* If enter this branch means there are some servers but not this one
 				reject the leader or lost connection with the leader, then here
@@ -1046,7 +1030,12 @@ func (rf *Raft) distributeAppendEntries()  (updateCommitted bool) {
 					if val.LastTerm == rf.Logs[len(rf.Logs)-2].Term || val.LastTerm == rf.Logs[len(rf.Logs)-1].Term {
 						rf.nextIndex[val.ID] = val.LastIndex + 1
 					} else {
-						rf.nextIndex[val.ID] = 1
+						if rf.Logs[0].Index == 0{
+							rf.nextIndex[val.ID] = 1
+						}else{
+							rf.nextIndex[val.ID] = rf.Logs[0].Index
+						}
+
 						//delta := rf.Logs[len(rf.Logs)-1].Index - rf.nextIndex[val.ID]
 						//if delta < 2 {
 						//	rf.nextIndex[val.ID] -= 3
