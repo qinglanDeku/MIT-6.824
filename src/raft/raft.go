@@ -43,17 +43,24 @@ var defaultLogCapacity = 1000
 
 // debug triggers
 var electionDebugEnable = false
-var replicationDebugEnable = true
+var replicationDebugEnable = false
+var snapshotDebugEnable = false
 
 func electionDebug(s string){
 	if electionDebugEnable{
-		log.Print(s)
+		log.Print("Election: ", s)
 	}
 }
 
 func replicationDebug(s string){
 	if replicationDebugEnable{
-		log.Print(s)
+		log.Print("Log Replication: ", s)
+	}
+}
+
+func snapshotDebug(s string){
+	if snapshotDebugEnable{
+		log.Print("Snapshot: ", s)
 	}
 }
 
@@ -147,6 +154,8 @@ type Raft struct {
 	commitIndexMap			map[int]int		// Map about the nextIndex array
 	updateFollowers			bool			// Indicate that the next Raft::distributedAppendEntries() is used by the
 										// leader to update followers commitIndex
+	distributedEntriesLock	sync.Mutex		// Lock for the leader, a leader can only run distributedEntries() in 1
+										// Thread
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -370,8 +379,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	*valid and must be retained.
 	 */
 	rf.mu.Lock()
-	if index > rf.Logs[len(rf.Logs)-1].Index {
-		index = rf.Logs[len(rf.Logs)-1].Index
+	snapshotDebug(fmt.Sprintf("Peer %v do snapshot, and the index is %v", rf.me, index))
+	if index >= rf.Logs[len(rf.Logs)-1].Index {
+		// We should not snapShot all logs in the server.
+		index = rf.Logs[len(rf.Logs)-1].Index - 1
 	}
 	if index == 0{
 		/* If no logs can be snapshot, directly return. */
@@ -386,11 +397,12 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	//var lastIncludedIndex = index
 	//var lastIncludedTerm = rf.Logs[index-curBeginIdx].Term
 	if lengthOfLog2Snap >= len(rf.Logs){
-		rf.Logs = rf.Logs[0:1]
+		rf.Logs = make([]LogEntry, 0, defaultLogCapacity)
 	}else{
 		rf.Logs = rf.Logs[index-curBeginIdx + 1:]
 	}
-	log.Printf("snapshot: peer: %v, snapshot length: %v, logs after snapshot:%v", rf.me, lengthOfLog2Snap, rf.Logs)
+	snapshotDebug(fmt.Sprintf("Peer%v, snapshot length: %v, snapshot index: %v," +
+		" logs after snapshot:%v", rf.me, lengthOfLog2Snap, index, rf.Logs))
 	rf.persister.SaveStateAndSnapshot(rf.state2Bytes(), newSnapshot)
 	rf.mu.Unlock()
 	//var msg = ApplyMsg{}
@@ -586,7 +598,7 @@ func (rf*Raft) followerUpdateCommitIndex(args *AppendEntriesArgs){
 			if args.Entries == nil && e.Term < rf.CurrentTerm {
 				break
 			}
-			if e.Index == 1{
+			if e.Index == 1 && rf.committedIndex == 0 && rf.Logs[0].Index == 0{
 				/* Before apply index 1 log, apply the dummy log */
 				initApplyMsg := ApplyMsg{}
 				initApplyMsg.Command = rf.Logs[0].Info
@@ -794,9 +806,22 @@ func (rf *Raft) applyMessage2Tester(logEntry LogEntry){
 	if rf.role == LEADER {
 		role = "Leader"
 	}
-	replicationDebug(fmt.Sprintf("%v%d apply log%d with command %d to tester", role, rf.me,
-		logEntry.Index,	logEntry.Info))
-	rf.applyChan <- msg
+	var applied = false
+	for !applied {
+		select{
+			case rf.applyChan <- msg:
+				replicationDebug(fmt.Sprintf("%v%d apply log%d with command %d to tester, the Logs are: %v", role, rf.me,
+					logEntry.Index,	logEntry.Info, rf.Logs))
+				applied = true
+				break
+			case <-time.After(time.Millisecond * 10):
+				rf.mu.Unlock()
+				time.Sleep(time.Millisecond * 10)
+				rf.mu.Lock()
+				break
+		}
+	}
+	//rf.applyChan <- msg
 }
 
 
@@ -839,7 +864,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		//for updateFollowers{
 		//	updateFollowers = rf.distributeAppendEntries()
 		//}
+		rf.mu.Unlock()
 		rf.distributeAppendEntries()
+		rf.mu.Lock()
 		if rf.role != LEADER{
 			/* If it is not a leader, then remove the newly added log entry */
 			rf.Logs = rf.Logs[:len(rf.Logs)-1]
@@ -904,7 +931,7 @@ func (rf *Raft) leaderUpdateCommitIndex() bool{
 				var endIndex = k + 1		//exclusive
 				for i := beginIndex ; i < endIndex; i++{
 					l := rf.Logs[i-rf.Logs[0].Index]
-					if l.Index == 1{
+					if l.Index == 1 && rf.committedIndex == 0 && rf.Logs[0].Index == 0{
 						/* Before apply index 1 log, apply the dummy log */
 						initApplyMsg := ApplyMsg{}
 						initApplyMsg.Command = rf.Logs[0].Info
@@ -915,8 +942,8 @@ func (rf *Raft) leaderUpdateCommitIndex() bool{
 					rf.applyMessage2Tester(l)
 				}
 				rf.committedIndex = k
-				replicationDebug(fmt.Sprintf("Leader%d's nextIndex[]:%d, matchIndex[]: %d", rf.me,
-					rf.nextIndex, rf.matchIndex))
+				replicationDebug(fmt.Sprintf("Leader%d's nextIndex[]:%d, matchIndex[]: %d, new committed Index %d:",
+					rf.me, rf.nextIndex, rf.matchIndex, k))
 				ret = true
 				//for i := 0; i < len(rf.peers); i++{
 				//	if i == rf.me{
@@ -936,6 +963,7 @@ func (rf *Raft) leaderUpdateCommitIndex() bool{
  * Return 0 means retry, return 1 means ok, and 2 means turn heartbeat to append entries
  */
 func (rf *Raft) distributeAppendEntries()  (updateCommitted bool) {
+	rf.distributedEntriesLock.Lock()
 	var followersNeedAppend = make([]int, 0)
 	for i := 0; i < len(rf.peers); i++{
 		if i != rf.me{
@@ -949,6 +977,7 @@ func (rf *Raft) distributeAppendEntries()  (updateCommitted bool) {
 	var disconnect = 0
 	for len(followersNeedAppend) > 0 {
 		var updateFollowersNeedAppend = make([]int, 0)
+		rf.mu.Lock()
 		for _, i := range followersNeedAppend {
 			if i == rf.me {
 				continue
@@ -964,8 +993,15 @@ func (rf *Raft) distributeAppendEntries()  (updateCommitted bool) {
 			appendEntriesReply := AppendEntriesReply{}
 			if rf.nextIndex[i] <= rf.Logs[len(rf.Logs)-1].Index {
 				if rf.nextIndex[i] > 0 {
-					args.PrevLogIndex = rf.Logs[rf.nextIndex[i]-rf.Logs[0].Index-1].Index
-					args.PrevLogTerm = rf.Logs[rf.nextIndex[i]-rf.Logs[0].Index-1].Term
+					if rf.nextIndex[i]-rf.Logs[0].Index-1 >= 0{
+						args.PrevLogIndex = rf.Logs[rf.nextIndex[i]-rf.Logs[0].Index-1].Index
+						args.PrevLogTerm = rf.Logs[rf.nextIndex[i]-rf.Logs[0].Index-1].Term
+					}else if rf.nextIndex[i]-rf.Logs[0].Index-1 == -1{
+						args.PrevLogIndex = rf.Logs[0].Index-1
+						args.PrevLogTerm = rf.Logs[0].Term
+					}else{
+						log.Fatalf("The nextIndex[%v] is much behind the index of leader", i)
+					}
 				} else {
 					if rf.Logs[0].Index == 0{
 						rf.nextIndex[i] = rf.Logs[0].Index + 1
@@ -1009,8 +1045,8 @@ func (rf *Raft) distributeAppendEntries()  (updateCommitted bool) {
 			}(responseChan, i, rf, &args, &appendEntriesReply)
 		}
 		/* If normal append entries rpc didn't reach one of the servers, the
-		leader will retry to send the append entries rpc until all */
-
+		leader will retry to send the append e
+		ntries rpc until all */
 		for round := 1; round < len(rf.peers) && disconnect < (len(rf.peers)+1)/2; round++ {
 			var val AppendEntriesCallResponse
 			select {
@@ -1021,13 +1057,15 @@ func (rf *Raft) distributeAppendEntries()  (updateCommitted bool) {
 					rf.role = FOLLOWER
 					notALeader = true
 					updateCommitted = false
+					rf.mu.Unlock()
+					rf.distributedEntriesLock.Unlock()
 					return
 				} else if val.Success > 0 && rf.CurrentTerm == val.Success {
 					/* If terms of leader and the follower are the same, then
 					the only reason why the follower reject the appendEntriesRPC
 					is that the term of prevLogIndex in the follower doesn't match
 					prevLogTerm */
-					if val.LastTerm == rf.Logs[len(rf.Logs)-2].Term || val.LastTerm == rf.Logs[len(rf.Logs)-1].Term {
+					if val.LastTerm == rf.Logs[len(rf.Logs)-1].Term {
 						rf.nextIndex[val.ID] = val.LastIndex + 1
 					} else {
 						if rf.Logs[0].Index == 0{
@@ -1053,7 +1091,7 @@ func (rf *Raft) distributeAppendEntries()  (updateCommitted bool) {
 					updateFollowersNeedAppend = append(updateFollowersNeedAppend, val.ID)
 					doUpdateCommitted = false
 				} else if val.Success == 0 {
-					if rf.nextIndex[val.ID] != rf.Logs[len(rf.Logs)-1].Index + 1{
+					if rf.nextIndex[val.ID] < rf.Logs[len(rf.Logs)-1].Index + 1{
 						rf.commitIndexMap[rf.matchIndex[val.ID]] -= 1
 						if rf.commitIndexMap[rf.matchIndex[val.ID]] <= 0 {
 							delete(rf.commitIndexMap, rf.matchIndex[val.ID])
@@ -1065,8 +1103,8 @@ func (rf *Raft) distributeAppendEntries()  (updateCommitted bool) {
 						} else {
 							rf.commitIndexMap[rf.matchIndex[val.ID]] = 1
 						}
+						doUpdateCommitted = true
 					}
-					doUpdateCommitted = true
 				} else {
 					/* lost connection with val.ID or server didn't reply in time */
 					//log.Printf( "Leader%d think peer%d lost connection", rf.me,
@@ -1081,19 +1119,26 @@ func (rf *Raft) distributeAppendEntries()  (updateCommitted bool) {
 				break
 			}
 		}
+		rf.mu.Unlock()
 		followersNeedAppend = updateFollowersNeedAppend
 	}
+	rf.mu.Lock()
 	if rf.updateFollowers{
 		rf.updateFollowers = false
 	}
+	rf.mu.Unlock()
 	if notALeader{
 		updateCommitted = false
+		rf.distributedEntriesLock.Unlock()
 		return
 	}
 	if doUpdateCommitted {
+		rf.mu.Lock()
 		updateCommitted = rf.leaderUpdateCommitIndex()
 		rf.updateFollowers = updateCommitted
+		rf.mu.Unlock()
 	}
+	rf.distributedEntriesLock.Unlock()
 	return
 }
 
@@ -1197,9 +1242,8 @@ func (rf *Raft) startElection(timeout int){
 			return
 		}
 		/* Send heartbeat twice since we need to wait the timeout of election */
-
-		rf.distributeAppendEntries()
 		rf.mu.Unlock()
+		rf.distributeAppendEntries()
 		//log.Printf("Peer %d is leader and finish first round of heartbeat!",
 			//rf.me)
 	}else{
@@ -1234,8 +1278,8 @@ func (rf *Raft) ticker() {
 				rf.mu.Unlock()
 				continue
 			}
-			rf.distributeAppendEntries()
 			rf.mu.Unlock()
+			rf.distributeAppendEntries()
 			//for rf.distributeAppendEntries( false) != 1{
 			//	time.Sleep(time.Millisecond * 10)
 			//}
