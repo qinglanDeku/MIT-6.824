@@ -36,6 +36,7 @@ import (
 // Some global values
 // Heartbeat period of leader to send, ms.
 var heartbeatCircle int64 = 200
+var leaderSleepTime	= int(heartbeatCircle)-10
 var electionTimeoutGap = 150
 // Election timeout, ms.
 var electionTimeoutLower = 200
@@ -115,12 +116,15 @@ func (le *LogEntry) toBytes() []byte{
 
 /* Called when doing snapshot, while turning to bytes, can also apply to tester*/
 func (rf *Raft) logs2Bytes(logs []LogEntry) []byte{
-	var retBytes = make([]byte, 0)
-	for _, entry := range logs{
-		newBytes := entry.toBytes()
-		retBytes = append(retBytes, newBytes...)
+	w := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(w)
+	for i := len(logs)-1; i >= 0; i--  {
+		err := encoder.Encode(logs[i].Info.(int))
+		if err != nil{
+			log.Fatalf("Failed to transfer log entry to bytes. ")
+		}
 	}
-	return retBytes
+	return w.Bytes()
 }
 
 
@@ -159,6 +163,8 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	snapshotChan			chan ApplyMsg	// Channel for passing snapshot data to Raft. Because we cannot directly use
+										// Raft::applyChan in Raft::Snapshot(), it will cause a deadlock for the applyChan
 
 }
 
@@ -290,7 +296,7 @@ type SnapshotReply struct{
 	Term				int
 }
 
-func (rf *Raft) sendInstallSnapshot(args *SnapshotArgs, reply *SnapshotReply, server int) bool{
+func (rf *Raft) sendInstallSnapshot(server int, args *SnapshotArgs, reply *SnapshotReply) bool{
 	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 	// log.Printf("Peer %d received response from peer %d", rf.me, server)
 	return ok
@@ -309,7 +315,81 @@ func (rf *Raft) InstallSnapshot(args *SnapshotArgs, reply *SnapshotReply){
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 
 	// Your code here (2D).
-	//rf.mu.Lock()
+	rf.mu.Lock()
+	if rf.role == LEADER{
+		var args = SnapshotArgs{
+			lastIncludedTerm,
+			lastIncludedIndex,
+			snapshot,
+		}
+		var snapshotReplyChannel = make(chan int, len(rf.peers))
+		for i := 0; i < len(rf.peers) && !rf.killed(); i++{
+			if i == rf.me{
+				continue
+			}
+			var reply = SnapshotReply{}
+			go func(server int, replyChan chan int, sender *Raft, args *SnapshotArgs,
+				reply *SnapshotReply){
+				if !sender.sendInstallSnapshot(server, args, reply){
+					replyChan <- -1
+				}else{
+					replyChan <- reply.Term
+				}
+			}(i, snapshotReplyChannel, rf, &args, &reply)
+		}
+
+		for i := 0; i < len(rf.peers)-1 && rf.role == LEADER; i++{
+			var retVal = 0
+			select{
+				case retVal = <- snapshotReplyChannel:
+					if retVal > 0 && retVal > rf.CurrentTerm{
+						rf.CurrentTerm = retVal
+						rf.role = FOLLOWER
+						rf.persist()
+						break
+					}
+				case <- time.After(time.Millisecond * 10):
+					break
+			}
+		}
+		rf.mu.Unlock()
+		return false
+	}else{
+		if rf.Logs[len(rf.Logs)-1].Index >= lastIncludedIndex{
+			if rf.Logs[0].Index <= lastIncludedIndex{
+				var discardPoint = lastIncludedIndex - rf.Logs[0].Index
+				if discardPoint == len(rf.Logs)-1{
+					/* Discard all log entries except the last entry */
+					rf.Logs = rf.Logs[discardPoint:]
+				}else{
+					rf.Logs = rf.Logs[discardPoint + 1:]
+				}
+			}
+			rf.mu.Unlock()
+			return false
+		}else{
+			/* Rebuild the logs of the receiver. */
+			var newLogs = make([]LogEntry, 0, defaultLogCapacity)
+			var idx = lastIncludedIndex
+			var commandBuf = bytes.NewBuffer(snapshot)
+			var decoder = labgob.NewDecoder(commandBuf)
+			var command interface{}
+			for err := decoder.Decode(&command); err == nil; err = decoder.Decode(&command){
+				var newEntry = LogEntry{
+					lastIncludedTerm,
+					idx,
+					command,
+				}
+				newLogs = append([]LogEntry{newEntry}, newLogs...)
+			}
+			rf.Logs = newLogs
+			// update the time
+			rf.lastHeartbeatUnixTime = time.Now().UnixNano()
+			rf.mu.Unlock()
+			return true
+		}
+
+	}
 	//var logsSize = len(rf.Logs)
 	//var curLastTerm = rf.Logs[logsSize-1].Term
 	//var curLastIndex = rf.Logs[logsSize-1].Index
@@ -404,13 +484,17 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	snapshotDebug(fmt.Sprintf("Peer%v, snapshot length: %v, snapshot index: %v," +
 		" logs after snapshot:%v", rf.me, lengthOfLog2Snap, index, rf.Logs))
 	rf.persister.SaveStateAndSnapshot(rf.state2Bytes(), newSnapshot)
+	if rf.role == LEADER{
+		var msg = ApplyMsg{}
+		msg.CommandValid = false
+		msg.SnapshotValid = true
+		msg.SnapshotIndex = snapshotLogs[len(snapshotLogs)-1].Index
+		msg.SnapshotTerm = snapshotLogs[len(snapshotLogs)-1].Term
+		msg.Snapshot = newSnapshot
+		rf.snapshotChan <- msg
+	}
 	rf.mu.Unlock()
-	//var msg = ApplyMsg{}
-	//msg.CommandValid = false
-	//msg.SnapshotValid = true
-	//msg.SnapshotIndex = lastIncludedIndex
-	//msg.SnapshotTerm = lastIncludedTerm
-	//rf.applyChan <- msg
+
 	//rf.mu.Unlock()
 }
 
@@ -821,6 +905,8 @@ func (rf *Raft) applyMessage2Tester(logEntry LogEntry){
 				break
 		}
 	}
+	//replicationDebug(fmt.Sprintf("%v%d apply log%d with command %d to tester, the Logs are: %v", role, rf.me,
+	//			logEntry.Index,	logEntry.Info, rf.Logs))
 	//rf.applyChan <- msg
 }
 
@@ -994,13 +1080,26 @@ func (rf *Raft) distributeAppendEntries()  (updateCommitted bool) {
 			if rf.nextIndex[i] <= rf.Logs[len(rf.Logs)-1].Index {
 				if rf.nextIndex[i] > 0 {
 					if rf.nextIndex[i]-rf.Logs[0].Index-1 >= 0{
+						/* After snapshot, the nextIndex for server i is after the first log entry in leader's logs */
 						args.PrevLogIndex = rf.Logs[rf.nextIndex[i]-rf.Logs[0].Index-1].Index
 						args.PrevLogTerm = rf.Logs[rf.nextIndex[i]-rf.Logs[0].Index-1].Term
 					}else if rf.nextIndex[i]-rf.Logs[0].Index-1 == -1{
+						/* After the snapshot, the nextIndex for server I is right the first log entry, TODO: How
+						to decide the term of last Index? Since it is possible to change a leader after snapshot */
 						args.PrevLogIndex = rf.Logs[0].Index-1
 						args.PrevLogTerm = rf.Logs[0].Term
 					}else{
-						log.Fatalf("The nextIndex[%v] is much behind the index of leader", i)
+						/* Here we need to send a new  */
+						var snapshotApplyArg = ApplyMsg{
+							CommandValid: false,
+							SnapshotValid: true,
+							SnapshotIndex: rf.Logs[0].Index-1,
+							SnapshotTerm: rf.Logs[0].Term,
+							Snapshot: rf.persister.ReadSnapshot(),
+						}
+						rf.snapshotChan <- snapshotApplyArg
+						/* jump over the AppendEntries call */
+						continue
 					}
 				} else {
 					if rf.Logs[0].Index == 0{
@@ -1050,73 +1149,73 @@ func (rf *Raft) distributeAppendEntries()  (updateCommitted bool) {
 		for round := 1; round < len(rf.peers) && disconnect < (len(rf.peers)+1)/2; round++ {
 			var val AppendEntriesCallResponse
 			select {
-			case val = <-responseChan:
-				if val.Success > 0 && rf.CurrentTerm < val.Success {
-					rf.CurrentTerm = val.Success
-					rf.persist()
-					rf.role = FOLLOWER
-					notALeader = true
-					updateCommitted = false
-					rf.mu.Unlock()
-					rf.distributedEntriesLock.Unlock()
-					return
-				} else if val.Success > 0 && rf.CurrentTerm == val.Success {
-					/* If terms of leader and the follower are the same, then
-					the only reason why the follower reject the appendEntriesRPC
-					is that the term of prevLogIndex in the follower doesn't match
-					prevLogTerm */
-					if val.LastTerm == rf.Logs[len(rf.Logs)-1].Term {
-						rf.nextIndex[val.ID] = val.LastIndex + 1
-					} else {
-						if rf.Logs[0].Index == 0{
-							rf.nextIndex[val.ID] = 1
-						}else{
-							rf.nextIndex[val.ID] = rf.Logs[0].Index
-						}
-
-						//delta := rf.Logs[len(rf.Logs)-1].Index - rf.nextIndex[val.ID]
-						//if delta < 2 {
-						//	rf.nextIndex[val.ID] -= 3
-						//}else if delta >= 2 && delta <=7{
-						//	rf.nextIndex[val.ID] -= 5
-						//}else{
-						//	rf.nextIndex[val.ID] -= delta
-						//}
-						//if rf.nextIndex[val.ID] <= 0{
-						//	rf.nextIndex[val.ID] = 1
-						//}
-					}
-					replicationDebug(fmt.Sprintf("Peer%d failed to get new log entry, decrease nextIndex to% d",
-						val.ID, rf.nextIndex[val.ID]))
-					updateFollowersNeedAppend = append(updateFollowersNeedAppend, val.ID)
-					doUpdateCommitted = false
-				} else if val.Success == 0 {
-					if rf.nextIndex[val.ID] < rf.Logs[len(rf.Logs)-1].Index + 1{
-						rf.commitIndexMap[rf.matchIndex[val.ID]] -= 1
-						if rf.commitIndexMap[rf.matchIndex[val.ID]] <= 0 {
-							delete(rf.commitIndexMap, rf.matchIndex[val.ID])
-						}
-						rf.nextIndex[val.ID] = rf.Logs[len(rf.Logs)-1].Index + 1
-						rf.matchIndex[val.ID] = rf.nextIndex[val.ID] - 1
-						if _, ok := rf.commitIndexMap[rf.matchIndex[val.ID]]; ok {
-							rf.commitIndexMap[rf.matchIndex[val.ID]] += 1
+				case val = <-responseChan:
+					if val.Success > 0 && rf.CurrentTerm < val.Success {
+						rf.CurrentTerm = val.Success
+						rf.persist()
+						rf.role = FOLLOWER
+						notALeader = true
+						updateCommitted = false
+						rf.mu.Unlock()
+						rf.distributedEntriesLock.Unlock()
+						return
+					} else if val.Success > 0 && rf.CurrentTerm == val.Success {
+						/* If terms of leader and the follower are the same, then
+						the only reason why the follower reject the appendEntriesRPC
+						is that the term of prevLogIndex in the follower doesn't match
+						prevLogTerm */
+						if val.LastTerm == rf.Logs[len(rf.Logs)-1].Term {
+							rf.nextIndex[val.ID] = val.LastIndex + 1
 						} else {
-							rf.commitIndexMap[rf.matchIndex[val.ID]] = 1
+							if rf.Logs[0].Index == 0{
+								rf.nextIndex[val.ID] = 1
+							}else{
+								rf.nextIndex[val.ID] = rf.Logs[0].Index
+							}
+
+							//delta := rf.Logs[len(rf.Logs)-1].Index - rf.nextIndex[val.ID]
+							//if delta < 2 {
+							//	rf.nextIndex[val.ID] -= 3
+							//}else if delta >= 2 && delta <=7{
+							//	rf.nextIndex[val.ID] -= 5
+							//}else{
+							//	rf.nextIndex[val.ID] -= delta
+							//}
+							//if rf.nextIndex[val.ID] <= 0{
+							//	rf.nextIndex[val.ID] = 1
+							//}
 						}
-						doUpdateCommitted = true
+						replicationDebug(fmt.Sprintf("Peer%d failed to get new log entry, decrease nextIndex to% d",
+							val.ID, rf.nextIndex[val.ID]))
+						updateFollowersNeedAppend = append(updateFollowersNeedAppend, val.ID)
+						doUpdateCommitted = false
+					} else if val.Success == 0 {
+						if rf.nextIndex[val.ID] < rf.Logs[len(rf.Logs)-1].Index + 1{
+							rf.commitIndexMap[rf.matchIndex[val.ID]] -= 1
+							if rf.commitIndexMap[rf.matchIndex[val.ID]] <= 0 {
+								delete(rf.commitIndexMap, rf.matchIndex[val.ID])
+							}
+							rf.nextIndex[val.ID] = rf.Logs[len(rf.Logs)-1].Index + 1
+							rf.matchIndex[val.ID] = rf.nextIndex[val.ID] - 1
+							if _, ok := rf.commitIndexMap[rf.matchIndex[val.ID]]; ok {
+								rf.commitIndexMap[rf.matchIndex[val.ID]] += 1
+							} else {
+								rf.commitIndexMap[rf.matchIndex[val.ID]] = 1
+							}
+							doUpdateCommitted = true
+						}
+					} else {
+						/* lost connection with val.ID or server didn't reply in time */
+						//log.Printf( "Leader%d think peer%d lost connection", rf.me,
+						//val.ID)
 					}
-				} else {
+					break
+				case <-time.After(time.Millisecond * 10):
 					/* lost connection with val.ID or server didn't reply in time */
-					//log.Printf( "Leader%d think peer%d lost connection", rf.me,
-					//val.ID)
-				}
-				break
-			case <-time.After(time.Millisecond * 10):
-				/* lost connection with val.ID or server didn't reply in time */
-				/* TODO: Under this situation, does the leader need to retry send
-				AppendEntriesRPC */
-				disconnect += 1
-				break
+					/* TODO: Under this situation, does the leader need to retry send
+					AppendEntriesRPC */
+					disconnect += 1
+					break
 			}
 		}
 		rf.mu.Unlock()
@@ -1138,6 +1237,15 @@ func (rf *Raft) distributeAppendEntries()  (updateCommitted bool) {
 		rf.updateFollowers = updateCommitted
 		rf.mu.Unlock()
 	}
+	rf.mu.Lock()
+	select{
+		case msg := <-rf.snapshotChan:
+			rf.applyChan<-msg
+			break
+		default:
+			break
+	}
+	rf.mu.Unlock()
 	rf.distributedEntriesLock.Unlock()
 	return
 }
@@ -1272,7 +1380,7 @@ func (rf *Raft) ticker() {
 				return
 			}
 			rf.mu.Unlock()
-			time.Sleep(time.Millisecond * time.Duration(int(heartbeatCircle)-10))
+			time.Sleep(time.Millisecond * time.Duration(leaderSleepTime))
 			rf.mu.Lock()
 			if rf.role != LEADER{
 				rf.mu.Unlock()
@@ -1364,6 +1472,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Other properties
 	rf.lastHeartbeatUnixTime = time.Now().UnixNano()
 	rf.updateFollowers = false
+	rf.snapshotChan = make(chan ApplyMsg, 1)
 	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash
